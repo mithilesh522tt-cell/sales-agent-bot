@@ -1,10 +1,11 @@
 import os
+from flask import Flask, request, jsonify
 import google.generativeai as genai
 
-# API key environment variable se aayegi
+app = Flask(__name__)
+
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
-# Business ka data - abhi ke liye simple dictionary mein (baad mein file/database se aayega)
 business_info = """
 Business Name: Sharma Saloon
 Timing: 9 AM - 8 PM (Monday closed)
@@ -12,7 +13,6 @@ Services: Haircut - Rs 150, Beard - Rs 80, Hair Color - Rs 500
 Address: Main Market, Sector 12
 """
 
-# System prompt - yeh agent ka "personality" aur instructions define karta hai
 system_prompt = f"""Tum ek friendly sales assistant ho jo customers ke sawaalon ka jawab deta hai.
 Business ki details neeche di hain, isi ke aadhar par jawab do:
 
@@ -30,17 +30,22 @@ model = genai.GenerativeModel(
     system_instruction=system_prompt
 )
 
-def chat_with_agent(chat_session, user_message):
-    response = chat_session.send_message(user_message)
-    return response.text
+# Home page - test karne ke liye, browser mein khul jayega
+@app.route("/")
+def home():
+    return "Agent chalu hai! /chat?message=haircut ka price kya hai use karke test karo"
 
-# Test karne ke liye - terminal mein chat karo
-if __name__ == "__main__":
-    print("Agent chalu ho gaya! (exit likhkar band karo)\n")
+# Chat endpoint - yahan se customer ka message bhejenge
+@app.route("/chat")
+def chat():
+    user_message = request.args.get("message", "")
+    if not user_message:
+        return jsonify({"error": "message parameter chahiye"})
+    
     chat_session = model.start_chat(history=[])
-    while True:
-        user_input = input("Customer: ")
-        if user_input.lower() == "exit":
-            break
-        reply = chat_with_agent(chat_session, user_input)
-        print(f"Agent: {reply}\n")
+    response = chat_session.send_message(user_message)
+    return jsonify({"reply": response.text})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
