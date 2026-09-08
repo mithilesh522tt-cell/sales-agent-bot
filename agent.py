@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import google.generativeai as genai
 
 app = Flask(__name__)
@@ -30,21 +30,35 @@ model = genai.GenerativeModel(
     system_instruction=system_prompt
 )
 
-# Home page - test karne ke liye, browser mein khul jayega
 @app.route("/")
 def home():
-    return "Agent chalu hai! /chat?message=haircut ka price kya hai use karke test karo"
+    return "Agent chalu hai!"
 
-# Chat endpoint - yahan se customer ka message bhejenge
+# Browser se test karne ke liye (pehle wala)
 @app.route("/chat")
 def chat():
     user_message = request.args.get("message", "")
     if not user_message:
-        return jsonify({"error": "message parameter chahiye"})
-    
+        return {"error": "message parameter chahiye"}
     chat_session = model.start_chat(history=[])
     response = chat_session.send_message(user_message)
-    return jsonify({"reply": response.text})
+    return {"reply": response.text}
+
+# WhatsApp (Twilio) se aane wale messages ke liye
+@app.route("/whatsapp", methods=["POST"])
+def whatsapp_reply():
+    incoming_message = request.form.get("Body", "")
+    
+    chat_session = model.start_chat(history=[])
+    response = chat_session.send_message(incoming_message)
+    reply_text = response.text
+    
+    # Twilio ko TwiML format mein jawaab dena hota hai
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message>{reply_text}</Message>
+</Response>"""
+    return twiml_response, 200, {"Content-Type": "text/xml"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
