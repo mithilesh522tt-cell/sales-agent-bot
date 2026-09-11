@@ -30,11 +30,14 @@ model = genai.GenerativeModel(
     system_instruction=system_prompt
 )
 
+# Har customer ki chat history yaha store hogi (temporary - memory mein)
+# Key: customer ka phone number, Value: uski conversation history
+customer_conversations = {}
+
 @app.route("/")
 def home():
     return "Agent chalu hai!"
 
-# Browser se test karne ke liye (pehle wala)
 @app.route("/chat")
 def chat():
     user_message = request.args.get("message", "")
@@ -44,16 +47,19 @@ def chat():
     response = chat_session.send_message(user_message)
     return {"reply": response.text}
 
-# WhatsApp (Twilio) se aane wale messages ke liye
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_reply():
     incoming_message = request.form.get("Body", "")
+    sender_number = request.form.get("From", "")  # customer ka WhatsApp number
     
-    chat_session = model.start_chat(history=[])
+    # Agar is number ki purani history nahi hai, nayi shuru karo
+    if sender_number not in customer_conversations:
+        customer_conversations[sender_number] = model.start_chat(history=[])
+    
+    chat_session = customer_conversations[sender_number]
     response = chat_session.send_message(incoming_message)
     reply_text = response.text
     
-    # Twilio ko TwiML format mein jawaab dena hota hai
     twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Message>{reply_text}</Message>
