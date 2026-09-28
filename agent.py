@@ -147,6 +147,7 @@ def dashboard():
         <h1>Sales Agent Dashboard</h1>
         <a class="card" href="/dashboard/chats">💬 Conversations</a>
         <a class="card" href="/dashboard/business">⚙️ Business Settings</a>
+        <a class="card" href="/dashboard/youtube">📚 Book Script Generator</a>
     </body>
     </html>
     """
@@ -234,6 +235,79 @@ def dashboard_business():
 
             <button type="submit">Save Changes</button>
         </form>
+    </body>
+    </html>
+    """
+    return html
+
+# Book summary/explanation script generator
+@app.route("/dashboard/youtube", methods=["GET", "POST"])
+def youtube_script():
+    script_result = None
+    book_name = ""
+    video_format = "short"
+
+    if request.method == "POST":
+        book_name = request.form.get("book_name", "")
+        video_format = request.form.get("format", "short")
+
+        if video_format == "short":
+            length_instruction = "Yeh ek YouTube SHORT (45-60 second) ke liye script hai. Bahut engaging hook se shuru karo, 3-4 main points crisp explain karo, aur ek strong ending line do."
+        else:
+            length_instruction = "Yeh ek LONG YouTube video (7-10 minute) ke liye detailed script hai. Achha hook, book ka background, 5-7 main lessons/concepts detail mein explain karo (apne shabdon mein, book se copy nahi), real-life examples do, aur ek achha conclusion do."
+
+        prompt = f"""Tum ek YouTube content writer ho jo books explain karta hai Hindi mein (Hinglish style, jaise log bolte hain).
+
+Book: {book_name}
+
+{length_instruction}
+
+Important: Book ke concepts/lessons apne shabdon mein samjhao, kahi se copy mat karo. Format yeh do:
+
+TITLE: (catchy YouTube title)
+
+HOOK: (pehli 2 lines jo curiosity banaye)
+
+SCRIPT:
+(poora script yaha)
+
+DESCRIPTION: (YouTube video description, 2-3 lines)
+
+TAGS: (5-8 relevant hashtags)
+"""
+
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
+        response = model.generate_content(prompt)
+        script_result = response.text
+
+    html = f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Arial; background: #f0f2f5; padding: 20px; }}
+            a.back {{ color: #007bff; text-decoration: none; font-size: 16px; }}
+            label {{ font-weight: bold; display: block; margin-top: 15px; }}
+            input, select {{ width: 100%; padding: 10px; margin-top: 5px; box-sizing: border-box; font-size: 16px; }}
+            button {{ margin-top: 20px; padding: 12px; background: #28a745; color: white; border: none; border-radius: 5px; width: 100%; font-size: 16px; }}
+            .result {{ background: white; padding: 15px; margin-top: 20px; border-radius: 8px; white-space: pre-wrap; font-size: 14px; line-height: 1.6; }}
+        </style>
+    </head>
+    <body>
+        <a class="back" href="/dashboard">&larr; Back</a>
+        <h2>📚 Book Script Generator</h2>
+        <form method="POST">
+            <label>Book ka naam</label>
+            <input type="text" name="book_name" value="{book_name}" placeholder="jaise: Atomic Habits" required>
+
+            <label>Video format</label>
+            <select name="format">
+                <option value="short" {"selected" if video_format=="short" else ""}>Short (45-60 sec)</option>
+                <option value="long" {"selected" if video_format=="long" else ""}>Long (7-10 min)</option>
+            </select>
+
+            <button type="submit">Script Generate Karo</button>
+        </form>
+        {"<div class='result'>" + script_result + "</div>" if script_result else ""}
     </body>
     </html>
     """
