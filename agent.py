@@ -1,7 +1,11 @@
 import os
-from flask import Flask, request
+import re
+import html as html_lib
+from io import BytesIO
+from flask import Flask, request, send_file
 import google.generativeai as genai
 import psycopg2
+from gtts import gTTS
 
 app = Flask(__name__)
 
@@ -240,6 +244,19 @@ def dashboard_business():
     """
     return html
 
+def extract_voiceover_text(script_text):
+    # Sirf HOOK aur SCRIPT wala part nikalo, title/description/tags chhod do
+    match = re.search(r"HOOK:(.*?)(DESCRIPTION:|TAGS:|$)", script_text, re.DOTALL)
+    if match:
+        text = match.group(1)
+    else:
+        text = script_text
+    # Markdown symbols hatao (** ## --- etc.)
+    text = re.sub(r"\*\*|#|---|SCRIPT:", "", text)
+    text = re.sub(r"\n{2,}", ". ", text)
+    text = text.strip()
+    return text
+
 # Book summary/explanation script generator
 @app.route("/dashboard/youtube", methods=["GET", "POST"])
 def youtube_script():
@@ -280,6 +297,17 @@ TAGS: (5-8 relevant hashtags)
         response = model.generate_content(prompt)
         script_result = response.text
 
+    escaped_script = html_lib.escape(script_result) if script_result else ""
+
+    voiceover_block = ""
+    if script_result:
+        voiceover_block = f"""
+        <form method="POST" action="/dashboard/youtube/audio" style="margin-top:15px;">
+            <textarea name="script_text" style="display:none;">{escaped_script}</textarea>
+            <button type="submit" style="background:#8e44ad;">🔊 Voiceover Banao (MP3)</button>
+        </form>
+        """
+
     html = f"""
     <html>
     <head>
@@ -308,10 +336,32 @@ TAGS: (5-8 relevant hashtags)
             <button type="submit">Script Generate Karo</button>
         </form>
         {"<div class='result'>" + script_result + "</div>" if script_result else ""}
+        {voiceover_block}
     </body>
     </html>
     """
     return html
+
+# Voiceover (MP3) banane wala route
+@app.route("/dashboard/youtube/audio", methods=["POST"])
+def youtube_audio():
+    script_text = request.form.get("script_text", "")
+    clean_text = extract_voiceover_text(script_text)
+
+    if not clean_text:
+        return "Voiceover ke liye text nahi mila", 400
+
+    tts = gTTS(text=clean_text, lang="hi")
+    audio_buffer = BytesIO()
+    tts.write_to_fp(audio_buffer)
+    audio_buffer.seek(0)
+
+    return send_file(
+        audio_buffer,
+        mimetype="audio/mpeg",
+        as_attachment=True,
+        download_name="voiceover.mp3"
+    )
 
 init_db()
 
