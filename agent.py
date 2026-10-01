@@ -1,11 +1,12 @@
 import os
 import re
 import html as html_lib
+import asyncio
+import edge_tts
 from io import BytesIO
 from flask import Flask, request, send_file
 import google.generativeai as genai
 import psycopg2
-from gtts import gTTS
 
 app = Flask(__name__)
 
@@ -245,13 +246,11 @@ def dashboard_business():
     return html
 
 def extract_voiceover_text(script_text):
-    # Sirf HOOK aur SCRIPT wala part nikalo, title/description/tags chhod do
     match = re.search(r"HOOK:(.*?)(DESCRIPTION:|TAGS:|$)", script_text, re.DOTALL)
     if match:
         text = match.group(1)
     else:
         text = script_text
-    # Markdown symbols hatao (** ## --- etc.)
     text = re.sub(r"\*\*|#|---|SCRIPT:", "", text)
     text = re.sub(r"\n{2,}", ". ", text)
     text = text.strip()
@@ -351,9 +350,19 @@ def youtube_audio():
     if not clean_text:
         return "Voiceover ke liye text nahi mila", 400
 
-    tts = gTTS(text=clean_text, lang="hi")
     audio_buffer = BytesIO()
-    tts.write_to_fp(audio_buffer)
+
+    async def generate_audio():
+        communicate = edge_tts.Communicate(
+            clean_text,
+            voice="hi-IN-MadhurNeural",
+            rate="+10%"
+        )
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_buffer.write(chunk["data"])
+
+    asyncio.run(generate_audio())
     audio_buffer.seek(0)
 
     return send_file(
