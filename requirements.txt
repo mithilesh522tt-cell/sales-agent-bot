@@ -2,4 +2,4 @@ flask
 google-generativeai
 gunicorn
 psycopg2-binary
-gTTS
+edge-tts
