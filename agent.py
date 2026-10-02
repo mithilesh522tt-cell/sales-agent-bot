@@ -251,8 +251,14 @@ def extract_voiceover_text(script_text):
         text = match.group(1)
     else:
         text = script_text
-    text = re.sub(r"\*\*|#|---|SCRIPT:", "", text)
+    text = re.sub(r"\*\*", "", text)
+    text = re.sub(r"#", "", text)
+    text = re.sub(r"---", "", text)
+    text = re.sub(r"SCRIPT:", "", text)
+    text = re.sub(r"Point \d+:", "", text)
+    text = re.sub(r"\(.*?\)", "", text)
     text = re.sub(r"\n{2,}", ". ", text)
+    text = re.sub(r"\s{2,}", " ", text)
     text = text.strip()
     return text
 
@@ -356,7 +362,8 @@ def youtube_audio():
         communicate = edge_tts.Communicate(
             clean_text,
             voice="hi-IN-MadhurNeural",
-            rate="+10%"
+            rate="+0%",
+            pitch="-5Hz"
         )
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
