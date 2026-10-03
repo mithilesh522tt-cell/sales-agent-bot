@@ -1,7 +1,9 @@
 import os
 import re
+import base64
 import html as html_lib
 import asyncio
+import requests
 import edge_tts
 from io import BytesIO
 from flask import Flask, request, send_file
@@ -262,6 +264,78 @@ def extract_voiceover_text(script_text):
     text = text.strip()
     return text
 
+# Roman Hinglish ko Devanagari Hindi mein badalta hai (voice natural lagti hai)
+def to_devanagari(text):
+    try:
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
+        prompt = (
+            "Neeche diye Hinglish text ko Devanagari (Hindi) script mein likho, "
+            "bilkul natural bolchal ki Hindi mein. English words ko bhi Devanagari mein "
+            "likho jaise Hindi mein bole jaate hain. Sirf converted text do, koi explanation "
+            "ya markdown mat do.\n\n" + text
+        )
+        resp = model.generate_content(prompt)
+        out = resp.text.strip()
+        return out if out else text
+    except Exception as e:
+        print("Devanagari conversion failed:", e)
+        return text
+
+# Gemini TTS se natural male Hindi voice (WAV bytes return karta hai)
+def gemini_tts_wav(text):
+    url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    headers = {
+        "x-goog-api-key": os.environ.get("GEMINI_API_KEY"),
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gemini-3.8-flash-tts",
+        "input": [{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
+                "text": text,
+                "annotations": [{
+                    "type": "speech_metadata",
+                    "style": "natural Hindi book narrator, confident and engaging, slightly faster pace"
+                }]
+            }]
+        }],
+        "response_format": {"type": "audio"},
+        "generation_config": {"speech_config": [{"voice": "Charon"}]}
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    r.raise_for_status()
+    data = r.json()
+
+    audio_b64 = None
+    for step in data.get("steps", []):
+        if step.get("type") == "model_output":
+            for c in step.get("content", []):
+                if c.get("type") == "audio":
+                    audio_b64 = c.get("data")
+    if not audio_b64:
+        raise ValueError("Audio response mein nahi mila")
+    return base64.b64decode(audio_b64)
+
+# Backup: edge-tts (agar Gemini TTS fail ho jaye)
+def edge_tts_mp3(text):
+    audio_buffer = BytesIO()
+
+    async def generate_audio():
+        communicate = edge_tts.Communicate(
+            text,
+            voice="hi-IN-MadhurNeural",
+            rate="+10%"
+        )
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_buffer.write(chunk["data"])
+
+    asyncio.run(generate_audio())
+    audio_buffer.seek(0)
+    return audio_buffer
+
 # Book summary/explanation script generator
 @app.route("/dashboard/youtube", methods=["GET", "POST"])
 def youtube_script():
@@ -309,7 +383,7 @@ TAGS: (5-8 relevant hashtags)
         voiceover_block = f"""
         <form method="POST" action="/dashboard/youtube/audio" style="margin-top:15px;">
             <textarea name="script_text" style="display:none;">{escaped_script}</textarea>
-            <button type="submit" style="background:#8e44ad;">🔊 Voiceover Banao (MP3)</button>
+            <button type="submit" style="background:#8e44ad;">🔊 Voiceover Banao</button>
         </form>
         """
 
@@ -347,7 +421,7 @@ TAGS: (5-8 relevant hashtags)
     """
     return html
 
-# Voiceover (MP3) banane wala route
+# Voiceover banane wala route
 @app.route("/dashboard/youtube/audio", methods=["POST"])
 def youtube_audio():
     script_text = request.form.get("script_text", "")
@@ -356,28 +430,25 @@ def youtube_audio():
     if not clean_text:
         return "Voiceover ke liye text nahi mila", 400
 
-    audio_buffer = BytesIO()
+    hindi_text = to_devanagari(clean_text)
 
-    async def generate_audio():
-        communicate = edge_tts.Communicate(
-            clean_text,
-            voice="hi-IN-MadhurNeural",
-            rate="+0%",
-            pitch="-5Hz"
+    try:
+        wav_bytes = gemini_tts_wav(hindi_text)
+        return send_file(
+            BytesIO(wav_bytes),
+            mimetype="audio/wav",
+            as_attachment=True,
+            download_name="voiceover.wav"
         )
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_buffer.write(chunk["data"])
-
-    asyncio.run(generate_audio())
-    audio_buffer.seek(0)
-
-    return send_file(
-        audio_buffer,
-        mimetype="audio/mpeg",
-        as_attachment=True,
-        download_name="voiceover.mp3"
-    )
+    except Exception as e:
+        print("Gemini TTS fail hua, edge-tts use kar rahe hain:", e)
+        mp3_buffer = edge_tts_mp3(hindi_text)
+        return send_file(
+            mp3_buffer,
+            mimetype="audio/mpeg",
+            as_attachment=True,
+            download_name="voiceover.mp3"
+        )
 
 init_db()
 
