@@ -4,3 +4,5 @@ gunicorn
 psycopg2-binary
 edge-tts
 requests
+Pillow
+imageio-ffmpeg
