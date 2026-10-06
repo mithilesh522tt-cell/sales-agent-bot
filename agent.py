@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import uuid
 import base64
@@ -14,7 +15,7 @@ from io import BytesIO
 from flask import Flask, request, send_file, redirect
 import google.generativeai as genai
 import psycopg2
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageFont
 import imageio_ffmpeg
 
 app = Flask(__name__)
@@ -346,22 +347,35 @@ def edge_tts_mp3_bytes(text):
     asyncio.run(generate_audio())
     return audio_buffer.getvalue()
 
-# Voice banata hai: (audio_bytes, "wav" ya "mp3") return karta hai
+# Voice banata hai: (audio_bytes, "wav" ya "mp3", hindi_text) return karta hai
 def make_voice(clean_text):
     hindi_text = to_devanagari(clean_text)
     try:
-        return gemini_tts_wav(hindi_text), "wav"
+        return gemini_tts_wav(hindi_text), "wav", hindi_text
     except Exception as e:
         print("Gemini TTS fail hua, edge-tts use kar rahe hain:", e)
-        return edge_tts_mp3_bytes(hindi_text), "mp3"
+        return edge_tts_mp3_bytes(hindi_text), "mp3", hindi_text
 
 # ---------------------------------------------------------------
-# VIDEO
+# VIDEO (stock photos + stock video + zoom + transitions + Hindi captions)
 # ---------------------------------------------------------------
 
-PALETTE = [(18, 24, 56), (40, 18, 56), (14, 52, 60), (56, 28, 18), (22, 44, 28)]
-ACCENT = (255, 196, 0)
 VIDEO_DIR = "/tmp/videos"
+FONT_DIR = "/tmp/fonts"
+FONT_FILE = os.path.join(FONT_DIR, "NotoSansDevanagari-Bold.ttf")
+FONT_URLS = [
+    "https://github.com/notofonts/devanagari/raw/main/fonts/NotoSansDevanagari/hinted/ttf/NotoSansDevanagari-Bold.ttf",
+    "https://github.com/openmaptiles/fonts/raw/master/noto-sans/NotoSansDevanagari-Bold.ttf",
+]
+W, H = 720, 1280          # Short (vertical) video size
+FPS = 24
+TRANS_DUR = 0.6           # transition ki length (second)
+SCENE_SECONDS = 4         # ek photo/clip lagbhag itni der dikhega
+MAX_VIDEO_SCENES = 4      # kitne scenes stock VIDEO clip honge (baaki photos)
+TRANSITIONS = ["fade", "slideleft", "zoomin", "circleopen", "wipeleft", "dissolve", "slideup", "smoothright"]
+FALLBACK_QUERIES = ["success business", "money coins", "city skyline", "person thinking",
+                    "books library", "office desk", "growth chart", "sunrise mountain"]
+BG_COLORS = [(18, 24, 56), (40, 18, 56), (14, 52, 60), (56, 28, 18), (22, 44, 28)]
 video_jobs = {}
 
 def ffmpeg_exe():
@@ -374,16 +388,8 @@ def audio_duration(path):
         raise ValueError("Audio ki length nahi mili")
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
-def ascii_caption_text(text):
-    text = text.replace("\u2014", "-").replace("\u2013", "-")
-    text = text.replace("\u2019", "'").replace("\u2018", "'")
-    text = text.replace("\u201c", '"').replace("\u201d", '"')
-    text = re.sub(r"[^\x00-\x7F]+", "", text)
-    text = re.sub(r"\s{2,}", " ", text)
-    return text.strip()
-
 def split_chunks(text, max_chars):
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = re.split(r"(?<=[.!?\u0964])\s+", text)
     chunks, cur = [], ""
     for s in sentences:
         s = s.strip()
@@ -398,7 +404,7 @@ def split_chunks(text, max_chars):
         chunks.append(cur)
     final = []
     for c in chunks:
-        while len(c) > max_chars * 1.6:
+        while len(c) > max_chars * 1.4:
             cut = c.rfind(" ", 0, max_chars)
             if cut <= 0:
                 cut = max_chars
@@ -408,81 +414,274 @@ def split_chunks(text, max_chars):
             final.append(c)
     return final
 
-def wrap_lines(draw, text, font, max_width):
-    words, lines, line = text.split(), [], ""
-    for w in words:
-        trial = (line + " " + w).strip()
-        if draw.textlength(trial, font=font) <= max_width:
-            line = trial
+# ---- Hindi font (ek baar download hota hai) ----
+def ensure_font():
+    os.makedirs(FONT_DIR, exist_ok=True)
+    if not (os.path.exists(FONT_FILE) and os.path.getsize(FONT_FILE) > 50000):
+        for url in FONT_URLS:
+            try:
+                r = requests.get(url, timeout=40)
+                if r.status_code == 200 and len(r.content) > 50000:
+                    with open(FONT_FILE, "wb") as f:
+                        f.write(r.content)
+                    break
+            except Exception as e:
+                print("Font download fail:", url, e)
+    if os.path.exists(FONT_FILE) and os.path.getsize(FONT_FILE) > 50000:
+        try:
+            return ImageFont.truetype(FONT_FILE, 20).getname()[0]
+        except Exception:
+            return "Noto Sans Devanagari"
+    return None
+
+# ---- Captions (ASS subtitle file, Hindi) ----
+def ass_time(t):
+    cs = int(round(t * 100))
+    h = cs // 360000
+    m = (cs % 360000) // 6000
+    s = (cs % 6000) / 100.0
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+def build_ass(hindi_text, total_dur, font_family, path):
+    chunks = split_chunks(hindi_text, 44)
+    total_len = sum(len(c) for c in chunks) or 1
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}", "WrapStyle: 0", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Cap,{font_family},{int(46 * W / 720)},&H00FFFFFF,&H00FFFFFF,&H80000000,&H00000000,1,0,0,0,100,100,0,0,3,{int(14 * W / 720)},0,2,{int(50 * W / 720)},{int(50 * W / 720)},{int(150 * W / 720)},1",
+        "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    t = 0.0
+    for c in chunks:
+        d = total_dur * len(c) / total_len
+        txt = c.replace("{", "(").replace("}", ")").replace("\n", " ")
+        lines.append(f"Dialogue: 0,{ass_time(t)},{ass_time(t + d)},Cap,,0,0,0,,{{\\fad(120,80)}}{txt}")
+        t += d
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+# ---- Scenes + stock media ----
+def plan_scenes(roman_text, total_dur):
+    n = max(3, min(12, int(round(total_dur / SCENE_SECONDS))))
+    total_chars = len(roman_text) or 1
+    target = total_chars / n
+
+    # sentences, aur lambe sentences ko comma pe todo, taaki har scene ~5 second ka bane
+    units = []
+    for sent in re.split(r"(?<=[.!?])\s+", roman_text):
+        sent = sent.strip()
+        if not sent:
+            continue
+        if len(sent) > target * 1.3:
+            parts = [p.strip() for p in re.split(r"(?<=[,;:])\s+", sent) if p.strip()]
+            units.extend(parts if parts else [sent])
         else:
-            if line:
-                lines.append(line)
-            line = w
-    if line:
-        lines.append(line)
-    return lines
+            units.append(sent)
+    if not units:
+        units = [roman_text]
 
-def make_slide(path, chunk, title, idx, total, size, color):
-    w, h = size
-    img = Image.new("RGB", (w, h), color)
-    d = ImageDraw.Draw(img)
-    big = max(34, w // 14) if h > w else max(34, w // 24)
-    small = max(22, w // 28) if h > w else max(22, w // 48)
-    font = ImageFont.load_default(size=big)
-    tfont = ImageFont.load_default(size=small)
+    groups, cur, cur_len = [], [], 0
+    for u in units:
+        cur.append(u)
+        cur_len += len(u)
+        if cur_len >= target * 0.9 and len(groups) < n - 1:
+            groups.append(" ".join(cur))
+            cur, cur_len = [], 0
+    if cur:
+        groups.append(" ".join(cur))
 
-    t = title[:40]
-    tw = d.textlength(t, font=tfont)
-    d.text(((w - tw) / 2, int(h * 0.06)), t, font=tfont, fill=ACCENT)
-    d.rectangle([int(w * 0.1), int(h * 0.06) + small + 14, int(w * 0.9), int(h * 0.06) + small + 18], fill=ACCENT)
+    lens = [max(len(g), 1) for g in groups]
+    durs = [max(2.5, total_dur * l / sum(lens)) for l in lens]
+    scale = total_dur / sum(durs)
+    durs = [d * scale for d in durs]
+    return groups, durs
 
-    lines = wrap_lines(d, chunk, font, int(w * 0.84))
-    line_h = big + 14
-    total_h = line_h * len(lines)
-    y = (h - total_h) / 2
-    for ln in lines:
-        lw = d.textlength(ln, font=font)
-        d.text(((w - lw) / 2, y), ln, font=font, fill=(255, 255, 255))
-        y += line_h
+def get_scene_queries(scene_texts, book_title):
+    n = len(scene_texts)
+    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(scene_texts))
+    prompt = (
+        f"Book: {book_title}\n"
+        f"Neeche {n} scenes hain (YouTube book-summary video ke). Har scene ke liye stock photo/video "
+        f"search karne ke liye ek English query do (2-4 words, koi concrete visual cheez, jaise "
+        f"'money coins desk', 'city skyline night', 'person thinking window'). "
+        f"Query mein kisi insaan ya brand ka naam mat rakho. "
+        f"Output sirf ek JSON array of {n} strings ho, aur kuch nahi.\n\n{numbered}"
+    )
+    queries = []
+    try:
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
+        txt = model.generate_content(prompt).text
+        m = re.search(r"\[.*\]", txt, re.DOTALL)
+        queries = [str(q).strip() for q in json.loads(m.group(0)) if str(q).strip()]
+    except Exception as e:
+        print("Scene queries fail:", e)
+    while len(queries) < n:
+        queries.append(FALLBACK_QUERIES[len(queries) % len(FALLBACK_QUERIES)])
+    return queries[:n]
 
-    bar_y = h - int(h * 0.04)
-    d.rectangle([0, bar_y, w, h], fill=(0, 0, 0))
-    d.rectangle([0, bar_y, int(w * (idx + 1) / total), h], fill=ACCENT)
-    img.save(path, "PNG")
+def pexels_get(url, params):
+    key = os.environ.get("PEXELS_API_KEY")
+    if not key:
+        raise ValueError("PEXELS_API_KEY set nahi hai")
+    r = requests.get(url, headers={"Authorization": key}, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-def build_video(caption_text, title, audio_path, out_path, work_dir, vertical=True):
-    os.makedirs(work_dir, exist_ok=True)
-    size = (720, 1280) if vertical else (1280, 720)
-    caption_text = ascii_caption_text(caption_text)
-    if not caption_text:
-        caption_text = title or "Book Summary"
-    chunks = split_chunks(caption_text, 70 if vertical else 110)
-    total_len = sum(len(c) for c in chunks)
-    dur = audio_duration(audio_path)
+def download_file(url, dest, max_mb=25):
+    with requests.get(url, stream=True, timeout=40) as r:
+        r.raise_for_status()
+        size = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(65536):
+                size += len(chunk)
+                if size > max_mb * 1024 * 1024:
+                    raise ValueError("Stock file bahut badi hai")
+                f.write(chunk)
 
-    list_path = os.path.join(work_dir, "list.txt")
-    last_img = None
-    with open(list_path, "w") as f:
-        for i, c in enumerate(chunks):
-            img_path = os.path.join(work_dir, f"slide_{i:03d}.png")
-            make_slide(img_path, c, title, i, len(chunks), size, PALETTE[i % len(PALETTE)])
-            seg = max(1.0, dur * len(c) / total_len)
-            f.write(f"file '{img_path}'\nduration {seg:.3f}\n")
-            last_img = img_path
-        f.write(f"file '{last_img}'\n")
+def fetch_stock_photo(query, used, dest):
+    data = pexels_get("https://api.pexels.com/v1/search",
+                      {"query": query, "orientation": "portrait", "per_page": 10})
+    for p in data.get("photos", []):
+        if ("p", p["id"]) in used:
+            continue
+        url = p["src"].get("portrait") or p["src"].get("large")
+        download_file(url, dest, max_mb=8)
+        used.add(("p", p["id"]))
+        return True
+    return False
 
-    cmd = [
-        ffmpeg_exe(), "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-        "-i", audio_path,
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
-        "-pix_fmt", "yuv420p", "-r", "12", "-crf", "30",
-        "-c:a", "aac", "-b:a", "96k", "-shortest",
-        "-movflags", "+faststart", out_path
+def fetch_stock_video(query, used, dest):
+    data = pexels_get("https://api.pexels.com/videos/search",
+                      {"query": query, "orientation": "portrait", "per_page": 10})
+    for v in data.get("videos", []):
+        if ("v", v["id"]) in used:
+            continue
+        files = [f for f in v.get("video_files", [])
+                 if f.get("file_type") == "video/mp4" and (f.get("width") or 0) >= 540]
+        if not files:
+            continue
+        files.sort(key=lambda f: f.get("width") or 9999)
+        download_file(files[0]["link"], dest, max_mb=25)
+        used.add(("v", v["id"]))
+        return True
+    return False
+
+def prepare_photo(src, dest):
+    img = Image.open(src).convert("RGB")
+    tw, th = 810, 1440
+    scale = max(tw / img.width, th / img.height)
+    img = img.resize((int(img.width * scale) + 1, int(img.height * scale) + 1), Image.LANCZOS)
+    left = (img.width - tw) // 2
+    top = (img.height - th) // 2
+    img.crop((left, top, left + tw, top + th)).save(dest, "JPEG", quality=88)
+
+def make_fallback_bg(dest, color):
+    tw, th = 810, 1440
+    col = Image.new("RGB", (1, th))
+    px = col.load()
+    bottom = tuple(int(c * 0.45) for c in color)
+    for y in range(th):
+        t = y / (th - 1)
+        px[0, y] = tuple(int(color[i] * (1 - t) + bottom[i] * t) for i in range(3))
+    col.resize((tw, th)).save(dest, "JPEG", quality=90)
+
+def gather_media(queries, work_dir, warnings):
+    # har scene ke liye ("photo"/"video", file_path) return karta hai
+    used, media, video_count = set(), [], 0
+    stock_ok = bool(os.environ.get("PEXELS_API_KEY"))
+    if not stock_ok:
+        warnings.append("PEXELS_API_KEY set nahi hai, isliye stock photo/video ki jagah simple background use hua.")
+    missing = 0
+    for i, q in enumerate(queries):
+        got = None
+        if stock_ok:
+            want_video = (i % 2 == 1) and video_count < MAX_VIDEO_SCENES
+            order = ["video", "photo"] if want_video else ["photo", "video"]
+            for kind in order:
+                if kind == "video" and video_count >= MAX_VIDEO_SCENES:
+                    continue
+                try:
+                    if kind == "photo":
+                        raw = os.path.join(work_dir, f"raw_{i}.jpg")
+                        if fetch_stock_photo(q, used, raw):
+                            prep = os.path.join(work_dir, f"photo_{i}.jpg")
+                            prepare_photo(raw, prep)
+                            got = ("photo", prep)
+                    else:
+                        vp = os.path.join(work_dir, f"clip_{i}.mp4")
+                        if fetch_stock_video(q, used, vp):
+                            got = ("video", vp)
+                            video_count += 1
+                except Exception as e:
+                    print("Stock fetch fail:", q, e)
+                if got:
+                    break
+        if not got:
+            bg = os.path.join(work_dir, f"bg_{i}.jpg")
+            make_fallback_bg(bg, BG_COLORS[i % len(BG_COLORS)])
+            got = ("photo", bg)
+            if stock_ok:
+                missing += 1
+        media.append(got)
+    if missing:
+        warnings.append(f"{missing} scene ke liye stock media nahi mila, wahan simple background laga.")
+    return media
+
+# ---- Final render ----
+def render_video(media, durs, ass_path, font_dir, audio_path, out_path, total_dur):
+    n = len(media)
+    T = TRANS_DUR
+    cmd = [ffmpeg_exe(), "-y"]
+    filters = []
+    zoom_in = True
+    for i, (kind, path) in enumerate(media):
+        L = durs[i] + (T if i < n - 1 else 0)
+        frames = max(2, int(round(L * FPS)))
+        if kind == "photo":
+            cmd += ["-i", path]
+            if zoom_in:
+                z = f"1+0.12*on/{frames}"
+            else:
+                z = f"1.12-0.12*on/{frames}"
+            zoom_in = not zoom_in
+            filters.append(
+                f"[{i}:v]zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                f":d={frames}:s={W}x{H}:fps={FPS},setsar=1,format=yuv420p,settb=1/{FPS}[v{i}]"
+            )
+        else:
+            cmd += ["-stream_loop", "-1", "-t", f"{L:.3f}", "-i", path]
+            filters.append(
+                f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
+                f"fps={FPS},setsar=1,format=yuv420p,settb=1/{FPS}[v{i}]"
+            )
+    audio_idx = n
+    cmd += ["-i", audio_path]
+
+    cur = "v0"
+    elapsed = 0.0
+    for k in range(1, n):
+        elapsed += durs[k - 1]
+        tr = TRANSITIONS[(k - 1) % len(TRANSITIONS)]
+        out = f"x{k}"
+        filters.append(f"[{cur}][v{k}]xfade=transition={tr}:duration={T}:offset={elapsed:.3f}[{out}]")
+        cur = out
+
+    if ass_path:
+        filters.append(f"[{cur}]subtitles=filename='{ass_path}':fontsdir='{font_dir}'[vout]")
+    else:
+        filters.append(f"[{cur}]format=yuv420p[vout]")
+
+    cmd += [
+        "-filter_complex_threads", "1", "-filter_complex", ";".join(filters),
+        "-map", "[vout]", "-map", f"{audio_idx}:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "29", "-threads", "1", "-x264-params", "rc-lookahead=0:ref=1:bframes=0:sync-lookahead=0", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_path
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError("ffmpeg fail: " + r.stderr[-400:])
-    return out_path
+        raise RuntimeError("ffmpeg fail: " + r.stderr[-500:])
 
 def cleanup_old_videos():
     try:
@@ -494,33 +693,49 @@ def cleanup_old_videos():
     except Exception:
         pass
 
-def run_video_job(job_id, script_text, title, vertical):
+def run_video_job(job_id, script_text, title):
     job = video_jobs[job_id]
     work_dir = os.path.join(VIDEO_DIR, job_id + "_work")
+    warnings = []
     try:
-        clean_text = extract_voiceover_text(script_text)
-        if not clean_text:
+        roman_text = extract_voiceover_text(script_text)
+        if not roman_text:
             raise ValueError("Script se text nahi mila")
-
-        job["msg"] = "Step 1/3: Voiceover ban raha hai (Hindi conversion + awaaz)..."
-        audio_bytes, ext = make_voice(clean_text)
-
         os.makedirs(work_dir, exist_ok=True)
+
+        job["msg"] = "Step 1/4: Voiceover ban raha hai (Hindi + awaaz)..."
+        audio_bytes, ext, hindi_text = make_voice(roman_text)
         audio_path = os.path.join(work_dir, "voice." + ext)
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
+        total_dur = audio_duration(audio_path)
 
-        job["msg"] = "Step 2/3: Slides aur video render ho raha hai..."
+        job["msg"] = "Step 2/4: Scenes plan ho rahe hain aur stock photo/video dhoondhe ja rahe hain..."
+        groups, durs = plan_scenes(roman_text, total_dur)
+        queries = get_scene_queries(groups, title)
+        media = gather_media(queries, work_dir, warnings)
+
+        job["msg"] = "Step 3/4: Hindi captions bana rahe hain..."
+        family = ensure_font()
+        ass_path = None
+        if family:
+            ass_path = os.path.join(work_dir, "captions.ass")
+            build_ass(hindi_text, total_dur, family, ass_path)
+        else:
+            warnings.append("Hindi font download nahi hua, isliye captions nahi lage.")
+
+        job["msg"] = "Step 4/4: Video render ho raha hai (zoom + transitions + captions)..."
         out_path = os.path.join(VIDEO_DIR, job_id + ".mp4")
-        build_video(clean_text, title, audio_path, out_path, work_dir, vertical)
+        render_video(media, durs, ass_path, FONT_DIR, audio_path, out_path, total_dur)
 
         job["file"] = out_path
         job["status"] = "done"
         job["msg"] = "Video ready!"
+        job["note"] = " ".join(warnings)
     except Exception as e:
         print("Video job fail:", e)
         job["status"] = "error"
-        job["msg"] = str(e)[:400]
+        job["msg"] = str(e)[:500]
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -573,13 +788,16 @@ TAGS: (5-8 relevant hashtags)
 
     action_block = ""
     if script_result:
-        action_block = f"""
+        if video_format == "short":
+            video_part = f"""
         <form method="POST" action="/dashboard/youtube/video" style="margin-top:15px;">
             <textarea name="script_text" style="display:none;">{escaped_script}</textarea>
-            <input type="hidden" name="format" value="{video_format}">
             <input type="hidden" name="book_name" value="{escaped_book}">
-            <button type="submit" style="background:#e67e22;">🎬 Video Banao (Voice + Captions)</button>
-        </form>
+            <button type="submit" style="background:#e67e22;">🎬 Video Banao (Stock + Zoom + Hindi Captions)</button>
+        </form>"""
+        else:
+            video_part = "<p style='color:#a94442;margin-top:15px;'>Long video ka render free server pe bahut slow hai, isliye abhi video sirf Short format ke liye hai.</p>"
+        action_block = video_part + f"""
         <form method="POST" action="/dashboard/youtube/audio" style="margin-top:5px;">
             <textarea name="script_text" style="display:none;">{escaped_script}</textarea>
             <button type="submit" style="background:#8e44ad;">🔊 Sirf Voiceover</button>
@@ -629,7 +847,7 @@ def youtube_audio():
     if not clean_text:
         return "Voiceover ke liye text nahi mila", 400
 
-    audio_bytes, ext = make_voice(clean_text)
+    audio_bytes, ext, _ = make_voice(clean_text)
     mimetype = "audio/wav" if ext == "wav" else "audio/mpeg"
     return send_file(
         BytesIO(audio_bytes),
@@ -642,9 +860,7 @@ def youtube_audio():
 @app.route("/dashboard/youtube/video", methods=["POST"])
 def youtube_video_start():
     script_text = request.form.get("script_text", "")
-    video_format = request.form.get("format", "short")
-    book_name = request.form.get("book_name", "") or "Book Summary"
-    title = ascii_caption_text(book_name) or "Book Summary"
+    book_name = (request.form.get("book_name", "") or "Book Summary").strip()[:60]
 
     os.makedirs(VIDEO_DIR, exist_ok=True)
     cleanup_old_videos()
@@ -654,11 +870,12 @@ def youtube_video_start():
         "status": "working",
         "msg": "Shuru ho raha hai...",
         "file": None,
+        "note": "",
         "start": time.time()
     }
     t = threading.Thread(
         target=run_video_job,
-        args=(job_id, script_text, title, video_format == "short"),
+        args=(job_id, script_text, book_name),
         daemon=True
     )
     t.start()
@@ -673,6 +890,8 @@ def youtube_video_status(job_id):
                 "<a href='/dashboard/youtube'>Dobara try karo</a>"), 404
 
     elapsed = int(time.time() - job["start"])
+    note = job.get("note", "")
+    note_html = f"<p style='background:#fff3cd;padding:10px;border-radius:6px;'>⚠️ {html_lib.escape(note)}</p>" if note else ""
     refresh = ""
     if job["status"] == "working":
         refresh = '<meta http-equiv="refresh" content="5">'
@@ -680,7 +899,7 @@ def youtube_video_status(job_id):
         <h3>⏳ Video ban raha hai...</h3>
         <p>{html_lib.escape(job['msg'])}</p>
         <p>Time ho gaya: {elapsed} second</p>
-        <p>Yeh page apne aap refresh hota rahega. Ise band mat karna, aur isme 2-3 minute lag sakte hain.</p>
+        <p>Yeh page apne aap refresh hota rahega. Ise band mat karna, free server pe isme 3-8 minute lag sakte hain.</p>
         """
     elif job["status"] == "done":
         body = f"""
@@ -690,6 +909,7 @@ def youtube_video_status(job_id):
         </video>
         <a class="dl" href="/dashboard/youtube/video/{job_id}/file?dl=1">⬇️ Video Download Karo</a>
         <p>Banane mein {elapsed} second lage.</p>
+        {note_html}
         """
     else:
         body = f"""
