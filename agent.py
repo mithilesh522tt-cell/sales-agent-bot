@@ -740,6 +740,161 @@ def run_video_job(job_id, script_text, title):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 # ---------------------------------------------------------------
+# SCRIPT + SEO
+# ---------------------------------------------------------------
+
+# Channel ka naam jab decide ho jaye yahan likh dena (khali rahega toh video mein bas "channel" bola jayega)
+CHANNEL_NAME = ""
+
+def build_script_prompt(book_name, video_format):
+    if CHANNEL_NAME:
+        subscribe_line = f"'{CHANNEL_NAME}' channel ko subscribe karne ki baat bolo"
+    else:
+        subscribe_line = "channel ko subscribe karne ki baat bolo"
+
+    cta_rule = (
+        "Ending mein yeh chaaron cheezein bolna zaroori hai, natural bolchal mein, 2-3 chhote vakyon mein: "
+        "(1) video pasand aaye toh LIKE karo, (2) kisi ek dost ko SHARE karo jise yeh sunna chahiye, "
+        "(3) COMMENT mein ek specific sawaal ka jawab likho (sawaal book ke topic se juda ho), "
+        f"(4) {subscribe_line}."
+    )
+
+    if video_format == "short":
+        length_instruction = (
+            "Yeh ek YouTube SHORT hai, voiceover lagbhag 45-55 second ka (kul 115-135 words, ending ke saath). Structure yeh rakho:\n"
+            "1) HOOK: pehli line sirf 8-14 words ki ho, jo seedha chonka de ya curiosity gap bana de "
+            "(koi shocking sach, ulta sawaal, ya 'aap galat soch rahe ho' wali baat). "
+            "Namaste, welcome ya book ka intro bilkul nahi.\n"
+            "2) OPEN LOOP: hook ke turant baad ek promise karo ki end mein ek aisi baat bataoge jo sab badal degi "
+            "(jaise 'Aur teesri baat sabse zyada khatarnak hai, wahin tak ruko').\n"
+            "3) THREE POINTS: har point ek chhota jhatka ho (contrast, galat dhaarna todna, ya ek real-life chhota scene). "
+            "Har point ke end mein agle point ke liye curiosity chhodo.\n"
+            "4) TWIST: end se pehle ek palat do, jaise 'Lekin asli sachchai yeh hai ki...', jo ab tak ki soch ko ulta kar de. "
+            "Open loop ka jawab yahin do.\n"
+            "5) ENDING: ek line ka takeaway, phir call to action. " + cta_rule
+        )
+        hashtag_rule = "3 se 5 hashtags, sabse zaroori pehle (YouTube pehle 3 title ke upar dikhata hai), aur aakhri hashtag #Shorts ho."
+    else:
+        length_instruction = (
+            "Yeh ek LONG YouTube video hai, voiceover lagbhag 7-10 minute ka. Structure yeh rakho:\n"
+            "1) HOOK: pehle 15 second mein chonkane wala sach ya sawaal, aur promise ki end mein ek bada twist milega.\n"
+            "2) 5-7 lessons, har lesson ek chhoti kahani ya real-life example ke saath, apne shabdon mein.\n"
+            "3) Har 1-2 lessons ke baad ek naya open loop ('lekin isse bhi badi galti aage aa rahi hai'). "
+            "Beech mein ek baar chhota sa 'agar ab tak pasand aa raha hai toh like kar do' bolo.\n"
+            "4) Aakhir se pehle bada TWIST jo poori video ki soch palat de, aur shuru ke promise ka jawab de.\n"
+            "5) ENDING: takeaway, phir call to action. " + cta_rule
+        )
+        hashtag_rule = "3 se 5 hashtags, sabse zaroori pehle (YouTube pehle 3 title ke upar dikhata hai)."
+
+    return f"""Tum ek top YouTube scriptwriter aur SEO expert ho jo books ko Hindi (Hinglish, Roman letters) mein suspense ke saath explain karta hai. Tumhari script ka kaam yeh hai ki dekhne wala beech mein video chhodke na jaye, aur video YouTube search mein dikhe.
+
+Book: {book_name}
+
+{length_instruction}
+
+Script likhne ke rules:
+- Chhote, tez vakya likho (zyada se zyada 12 words). Har vakya ke end mein full stop, sawaal ya exclamation lagao, kyunki awaaz wahin ruk-ruk ke bolegi.
+- Seedhi doston jaisi bolchal ki bhasha, jaise koi dost raaz bata raha ho.
+- Koi emoji, bullet list, markdown, ya brackets mein stage directions mat likho. Sirf wahi text likho jo bola jayega.
+- Book ke concepts apne shabdon mein samjhao. Book ke asli ideas hi use karo. Jhoothe statistics, nakli quotes ya banaye hue kisse mat likho.
+- HOOK mein jo lines likho unhe SCRIPT mein dobara mat likhna, SCRIPT wahin se aage badhe.
+
+SEO ke rules (YouTube search ke liye):
+- TITLE: 60 characters ke andar. Main keyword shuru mein (book ka naam aur 'Book Summary in Hindi' jaisa search term), saath mein curiosity ya number. Jhooth wala clickbait nahi, video mein jo hai wahi promise karo.
+- DESCRIPTION: pehli 2 lines (150 characters ke andar) mein main keyword aur hook ho, kyunki search mein wahi dikhti hain. Phir 2-3 lines mein video ka summary, aur end mein ek line: Like, Share, Comment aur Subscribe karna mat bhoolna. Author ka naam tabhi likho jab pakka pata ho.
+- HASHTAGS: {hashtag_rule}
+- TAGS: 10-12 search keywords, comma se alag, Hinglish aur English dono mix (jaise 'atomic habits summary in hindi', 'book summary hindi', 'best self help books'), kul 400 characters ke andar.
+- PINNED COMMENT: 1-2 line ka sawaal jo log comment mein jawab dene ko majboor ho jayein.
+- THUMBNAIL TEXT: 3-5 words, badi akshar mein dikhne layak, curiosity wala.
+
+Format bilkul yahi rakho, isi order mein (headings ke naam mat badalna):
+
+TITLE: (title)
+
+HOOK: (pehli 1-2 chonkane wali lines, jo video ke shuru mein bolenge)
+
+SCRIPT:
+(hook ke baad ka poora script: open loop, points, twist, ending aur call to action)
+
+DESCRIPTION: (description)
+
+HASHTAGS: (hashtags)
+
+TAGS: (comma se alag keywords)
+
+PINNED COMMENT: (comment)
+
+THUMBNAIL TEXT: (text)
+"""
+
+def parse_sections(text):
+    # Gemini ke output ko TITLE/DESCRIPTION/TAGS jaise hisson mein todta hai
+    clean = text.replace("**", "")
+    clean = re.sub(r"(?m)^\s*-{3,}\s*$", "", clean)
+    pattern = r"(?im)^\s*(TITLE|HOOK|SCRIPT|DESCRIPTION|HASHTAGS|TAGS|PINNED COMMENT|THUMBNAIL TEXT)\s*:\s*"
+    matches = list(re.finditer(pattern, clean))
+    sections = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(clean)
+        sections[m.group(1).upper()] = clean[m.end():end].strip()
+    return sections
+
+COPY_JS = """
+<script>
+function copyText(id, btn) {
+  var el = document.getElementById(id);
+  var txt = el.innerText;
+  function done() {
+    btn.innerText = '✅ Copy ho gaya';
+    setTimeout(function() { btn.innerText = '📋 Copy'; }, 1500);
+  }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(txt).then(done);
+  } else {
+    var r = document.createRange();
+    r.selectNodeContents(el);
+    var s = window.getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+    document.execCommand('copy');
+    done();
+  }
+}
+</script>
+"""
+
+def build_seo_cards(sections):
+    if not sections.get("TITLE") and not sections.get("DESCRIPTION"):
+        return ""
+    title = sections.get("TITLE", "").replace("\n", " ").strip()
+    desc = sections.get("DESCRIPTION", "").strip()
+    hashtags = sections.get("HASHTAGS", "").replace("\n", " ").strip()
+    full_desc = (desc + "\n\n" + hashtags).strip()
+    tags = sections.get("TAGS", "").replace("\n", " ").strip()
+    pinned = sections.get("PINNED COMMENT", "").strip()
+    thumb = sections.get("THUMBNAIL TEXT", "").strip()
+
+    items = [
+        ("Title", title, f"{len(title)} characters (60 ke andar best)"),
+        ("Description (hashtags ke saath)", full_desc, ""),
+        ("Tags", tags, f"{len(tags)} characters (500 ke andar rakho)"),
+        ("Pinned comment", pinned, ""),
+        ("Thumbnail text", thumb, ""),
+    ]
+    out = "<div class='seo'><h3>📈 YouTube SEO Details</h3>"
+    for i, (label, value, hint) in enumerate(items):
+        if not value:
+            continue
+        hint_html = (" <small>" + html_lib.escape(hint) + "</small>") if hint else ""
+        out += (
+            "<div class='seo-item'><b>" + html_lib.escape(label) + "</b>" + hint_html +
+            "<div class='seo-text' id='seo" + str(i) + "'>" + html_lib.escape(value) + "</div>"
+            "<button class='copy' type='button' onclick=\"copyText('seo" + str(i) + "', this)\">📋 Copy</button></div>"
+        )
+    out += "</div>" + COPY_JS
+    return out
+
+# ---------------------------------------------------------------
 # YOUTUBE DASHBOARD PAGES
 # ---------------------------------------------------------------
 
@@ -753,31 +908,7 @@ def youtube_script():
         book_name = request.form.get("book_name", "")
         video_format = request.form.get("format", "short")
 
-        if video_format == "short":
-            length_instruction = "Yeh ek YouTube SHORT (45-60 second) ke liye script hai. Bahut engaging hook se shuru karo, 3-4 main points crisp explain karo, aur ek strong ending line do."
-        else:
-            length_instruction = "Yeh ek LONG YouTube video (7-10 minute) ke liye detailed script hai. Achha hook, book ka background, 5-7 main lessons/concepts detail mein explain karo (apne shabdon mein, book se copy nahi), real-life examples do, aur ek achha conclusion do."
-
-        prompt = f"""Tum ek YouTube content writer ho jo books explain karta hai Hindi mein (Hinglish style, jaise log bolte hain).
-
-Book: {book_name}
-
-{length_instruction}
-
-Important: Book ke concepts/lessons apne shabdon mein samjhao, kahi se copy mat karo. Format yeh do:
-
-TITLE: (catchy YouTube title)
-
-HOOK: (pehli 2 lines jo curiosity banaye)
-
-SCRIPT:
-(poora script yaha)
-
-DESCRIPTION: (YouTube video description, 2-3 lines)
-
-TAGS: (5-8 relevant hashtags)
-"""
-
+        prompt = build_script_prompt(book_name, video_format)
         model = genai.GenerativeModel(model_name="gemini-3.6-flash")
         response = model.generate_content(prompt)
         script_result = response.text
@@ -785,6 +916,7 @@ TAGS: (5-8 relevant hashtags)
     escaped_script = html_lib.escape(script_result) if script_result else ""
     escaped_book = html_lib.escape(book_name, quote=True)
     escaped_result = html_lib.escape(script_result) if script_result else ""
+    seo_block = build_seo_cards(parse_sections(script_result)) if script_result else ""
 
     action_block = ""
     if script_result:
@@ -807,6 +939,7 @@ TAGS: (5-8 relevant hashtags)
     html = f"""
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {{ font-family: Arial; background: #f0f2f5; padding: 20px; }}
             a.back {{ color: #007bff; text-decoration: none; font-size: 16px; }}
@@ -814,6 +947,10 @@ TAGS: (5-8 relevant hashtags)
             input[type=text], select {{ width: 100%; padding: 10px; margin-top: 5px; box-sizing: border-box; font-size: 16px; }}
             button {{ margin-top: 20px; padding: 12px; background: #28a745; color: white; border: none; border-radius: 5px; width: 100%; font-size: 16px; }}
             .result {{ background: white; padding: 15px; margin-top: 20px; border-radius: 8px; white-space: pre-wrap; font-size: 14px; line-height: 1.6; }}
+            .seo {{ background: white; padding: 15px; margin-top: 20px; border-radius: 8px; }}
+            .seo-item {{ margin-top: 14px; }}
+            .seo-text {{ background: #f6f6f6; padding: 10px; border-radius: 6px; margin-top: 6px; white-space: pre-wrap; font-size: 14px; word-break: break-word; }}
+            button.copy {{ margin-top: 8px; padding: 8px; background: #3498db; font-size: 14px; }}
         </style>
     </head>
     <body>
@@ -833,6 +970,7 @@ TAGS: (5-8 relevant hashtags)
         </form>
         {"<div class='result'>" + escaped_result + "</div>" if script_result else ""}
         {action_block}
+        {seo_block}
     </body>
     </html>
     """
