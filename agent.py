@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import hashlib
 import time
 import uuid
 import base64
@@ -276,22 +277,49 @@ def extract_voiceover_text(script_text):
     text = text.strip()
     return text
 
+# Text ke liye models ki list: pehle main model (jaisa pehle tha), fail ho toh halka model
+TEXT_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+
+def gemini_text(prompt):
+    last_err = None
+    for name in TEXT_MODELS:
+        try:
+            resp = genai.GenerativeModel(model_name=name).generate_content(prompt)
+            text = (resp.text or "").strip()
+            if text:
+                return text
+        except Exception as e:
+            last_err = e
+            print("Gemini text fail:", name, e)
+    raise RuntimeError("Gemini se jawab nahi mila: " + str(last_err)[:200])
+
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
 # Roman Hinglish ko Devanagari Hindi mein badalta hai (voice natural lagti hai)
+# (text, ok) return karta hai. ok=False matlab conversion nahi hua, Roman text hi wapas aaya.
 def to_devanagari(text):
+    prompt = (
+        "Neeche diye Hinglish text ko Devanagari (Hindi) script mein likho, "
+        "bilkul natural bolchal ki Hindi mein. English words ko bhi Devanagari mein "
+        "likho jaise Hindi mein bole jaate hain. Sirf converted text do, koi explanation "
+        "ya markdown mat do.\n\n" + text
+    )
     try:
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
-        prompt = (
-            "Neeche diye Hinglish text ko Devanagari (Hindi) script mein likho, "
-            "bilkul natural bolchal ki Hindi mein. English words ko bhi Devanagari mein "
-            "likho jaise Hindi mein bole jaate hain. Sirf converted text do, koi explanation "
-            "ya markdown mat do.\n\n" + text
-        )
-        resp = model.generate_content(prompt)
-        out = resp.text.strip()
-        return out if out else text
+        out = gemini_text(prompt)
     except Exception as e:
         print("Devanagari conversion failed:", e)
-        return text
+        return text, False
+    out = re.sub(r"```[a-zA-Z]*", "", out).strip()
+    lines = out.splitlines()
+    has_dev = [bool(DEVANAGARI_RE.search(l)) for l in lines]
+    while lines and not has_dev[0] and any(has_dev):
+        lines.pop(0)
+        has_dev.pop(0)
+    out = "\n".join(lines).strip()
+    if len(DEVANAGARI_RE.findall(out)) < 10:
+        print("Devanagari conversion: output Hindi script mein nahi aaya")
+        return text, False
+    return out, True
 
 # Gemini TTS se natural male Hindi voice (WAV bytes return karta hai)
 def gemini_tts_wav(text):
@@ -347,14 +375,51 @@ def edge_tts_mp3_bytes(text):
     asyncio.run(generate_audio())
     return audio_buffer.getvalue()
 
-# Voice banata hai: (audio_bytes, "wav" ya "mp3", hindi_text) return karta hai
+def describe_error(e):
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            return f"HTTP {resp.status_code}: {resp.text[:150]}".replace("\n", " ")
+        except Exception:
+            pass
+    return str(e)[:150].replace("\n", " ")
+
+voice_cache = {}
+VOICE_CACHE_MAX = 5
+
+# Voice banata hai: (audio_bytes, "wav" ya "mp3", hindi_text, note) return karta hai
+# Voice wahi hai jo pehle thi (Gemini TTS, Charon). Fail hone par ek baar dobara try, phir backup voice.
+# note mein likha aata hai agar kuch fail hua (status page pe dikhta hai).
 def make_voice(clean_text):
-    hindi_text = to_devanagari(clean_text)
-    try:
-        return gemini_tts_wav(hindi_text), "wav", hindi_text
-    except Exception as e:
-        print("Gemini TTS fail hua, edge-tts use kar rahe hain:", e)
-        return edge_tts_mp3_bytes(hindi_text), "mp3", hindi_text
+    key = hashlib.sha1(clean_text.encode("utf-8")).hexdigest()
+    if key in voice_cache:
+        return voice_cache[key]
+
+    notes = []
+    hindi_text, conv_ok = to_devanagari(clean_text)
+    if not conv_ok:
+        notes.append("Hindi conversion fail hua, isliye voice Roman text se bani (quality kam ho sakti hai).")
+
+    audio, ext, last_err = None, None, ""
+    for attempt in range(2):
+        try:
+            audio, ext = gemini_tts_wav(hindi_text), "wav"
+            break
+        except Exception as e:
+            last_err = describe_error(e)
+            print("Gemini TTS fail hua:", last_err)
+            if attempt == 0:
+                time.sleep(6)
+    if audio is None:
+        notes.append(f"Gemini voice fail hua ({last_err}), isliye backup voice use hui.")
+        audio, ext = edge_tts_mp3_bytes(hindi_text), "mp3"
+
+    result = (audio, ext, hindi_text, " ".join(notes))
+    if ext == "wav" and conv_ok:
+        voice_cache[key] = result
+        while len(voice_cache) > VOICE_CACHE_MAX:
+            voice_cache.pop(next(iter(voice_cache)))
+    return result
 
 # ---------------------------------------------------------------
 # VIDEO (stock photos + stock video + zoom + transitions + Hindi captions)
@@ -371,7 +436,8 @@ W, H = 720, 1280          # Short (vertical) video size
 FPS = 24
 TRANS_DUR = 0.6           # transition ki length (second)
 SCENE_SECONDS = 4         # ek photo/clip lagbhag itni der dikhega
-MAX_VIDEO_SCENES = 4      # kitne scenes stock VIDEO clip honge (baaki photos)
+MAX_VIDEO_SCENES = 2      # kitne scenes stock VIDEO clip honge (baaki photos). Har clip ~35 MB memory leti hai,
+                          # free server pe 2 theek hai. "out of memory" aaye toh 1 ya 0 kar do, paid server pe 6 tak badha sakte ho.
 TRANSITIONS = ["fade", "slideleft", "zoomin", "circleopen", "wipeleft", "dissolve", "slideup", "smoothright"]
 FALLBACK_QUERIES = ["success business", "money coins", "city skyline", "person thinking",
                     "books library", "office desk", "growth chart", "sunrise mountain"]
@@ -509,17 +575,17 @@ def get_scene_queries(scene_texts, book_title):
         f"Query mein kisi insaan ya brand ka naam mat rakho. "
         f"Output sirf ek JSON array of {n} strings ho, aur kuch nahi.\n\n{numbered}"
     )
-    queries = []
+    queries, note = [], ""
     try:
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
-        txt = model.generate_content(prompt).text
+        txt = gemini_text(prompt)
         m = re.search(r"\[.*\]", txt, re.DOTALL)
         queries = [str(q).strip() for q in json.loads(m.group(0)) if str(q).strip()]
     except Exception as e:
         print("Scene queries fail:", e)
+        note = "Scene ke hisaab se images dhoondhne wala step fail hua, isliye general stock images use hui."
     while len(queries) < n:
         queries.append(FALLBACK_QUERIES[len(queries) % len(FALLBACK_QUERIES)])
-    return queries[:n]
+    return queries[:n], note
 
 def pexels_get(url, params):
     key = os.environ.get("PEXELS_API_KEY")
@@ -590,6 +656,9 @@ def make_fallback_bg(dest, color):
 def gather_media(queries, work_dir, warnings):
     # har scene ke liye ("photo"/"video", file_path) return karta hai
     used, media, video_count = set(), [], 0
+    n_scenes = len(queries)
+    # video clips poore video mein barabar doori pe lagenge
+    video_slots = set(int(round((k + 1) * n_scenes / (MAX_VIDEO_SCENES + 1))) for k in range(MAX_VIDEO_SCENES))
     stock_ok = bool(os.environ.get("PEXELS_API_KEY"))
     if not stock_ok:
         warnings.append("PEXELS_API_KEY set nahi hai, isliye stock photo/video ki jagah simple background use hua.")
@@ -597,7 +666,7 @@ def gather_media(queries, work_dir, warnings):
     for i, q in enumerate(queries):
         got = None
         if stock_ok:
-            want_video = (i % 2 == 1) and video_count < MAX_VIDEO_SCENES
+            want_video = (i in video_slots) and video_count < MAX_VIDEO_SCENES
             order = ["video", "photo"] if want_video else ["photo", "video"]
             for kind in order:
                 if kind == "video" and video_count >= MAX_VIDEO_SCENES:
@@ -629,8 +698,78 @@ def gather_media(queries, work_dir, warnings):
         warnings.append(f"{missing} scene ke liye stock media nahi mila, wahan simple background laga.")
     return media
 
+# ---- Background music ----
+MUSIC_ON = True           # background music chahiye toh True, nahi chahiye toh False
+MUSIC_GAIN = 2.5          # music ki awaaz (bada number = tez music)
+MUSIC_DIR = "/tmp/music"
+REPO_MUSIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music.mp3")
+
+def ambient_expr():
+    # Am - F - C - G chords (har chord 4 second, 16 second ka loop) + halke pentatonic plucks
+    chords = [
+        [110.00, 164.81, 220.00, 261.63],
+        [87.31, 130.81, 174.61, 220.00],
+        [130.81, 196.00, 261.63, 329.63],
+        [98.00, 146.83, 196.00, 246.94],
+    ]
+    parts = []
+    for c, notes in enumerate(chords):
+        p = f"mod(t-{4 * c}+0.5+16,16)"
+        win = f"if(lt({p},5),pow(sin(PI*{p}/5),2),0)"
+        tone = "+".join(f"(sin(2*PI*{f}*t)+0.25*sin(4*PI*{f}*t))" for f in notes)
+        parts.append(f"{win}*({tone})")
+    pad = "(" + "+".join(parts) + ")*0.045"
+    semis = [0, 3, 5, 7, 10]
+    step = "floor(t*2)"
+    idx = f"mod({step}*3+floor({step}/8),5)"
+    sel = "0"
+    for i in range(len(semis) - 1, -1, -1):
+        sel = f"if(eq({idx},{i}),{semis[i]},{sel})"
+    freq = f"(440*pow(2,({sel})/12))"
+    env = "exp(-5*mod(t,0.5))*min(1,mod(t,0.5)*80)"
+    gate = f"if(eq(mod({step},3),2),0,1)"
+    pluck = f"{gate}*{env}*sin(2*PI*{freq}*t)*0.03"
+    return f"{pad}+{pluck}"
+
+def generate_ambient_loop(dest):
+    # 32 second banao, reverb lagao, beech ka 16 second lo => seamless loop
+    tmp = dest + ".tmp.wav"
+    cmd = [ffmpeg_exe(), "-y", "-f", "lavfi", "-i", f"aevalsrc='{ambient_expr()}':s=22050:d=32",
+           "-af", "lowpass=f=2200,highpass=f=70,aecho=0.8:0.6:70|140|210:0.35|0.25|0.15,"
+                  "atrim=start=16:end=32,asetpts=PTS-STARTPTS",
+           "-ac", "1", tmp]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("music generate fail: " + r.stderr[-300:])
+    os.replace(tmp, dest)
+
+# (music_file_path, label) return karta hai. Pehle repo ka music.mp3, phir MUSIC_URL, phir auto-generated ambient.
+def ensure_music(warnings):
+    if os.path.exists(REPO_MUSIC):
+        return REPO_MUSIC, "apna track (music.mp3)"
+    os.makedirs(MUSIC_DIR, exist_ok=True)
+    url = os.environ.get("MUSIC_URL", "").strip()
+    if url:
+        dest = os.path.join(MUSIC_DIR, "custom_music")
+        try:
+            if not (os.path.exists(dest) and os.path.getsize(dest) > 20000):
+                download_file(url, dest, max_mb=20)
+            return dest, "MUSIC_URL wala track"
+        except Exception as e:
+            print("MUSIC_URL download fail:", e)
+            warnings.append("MUSIC_URL wala track download nahi hua, isliye auto ambient music lagi.")
+    dest = os.path.join(MUSIC_DIR, "ambient_loop.wav")
+    try:
+        if not (os.path.exists(dest) and os.path.getsize(dest) > 20000):
+            generate_ambient_loop(dest)
+        return dest, "ambient music (auto-generated)"
+    except Exception as e:
+        print("Music fail:", e)
+        warnings.append("Background music nahi ban payi, video bina music ke bani.")
+        return None, "music nahi laga"
+
 # ---- Final render ----
-def render_video(media, durs, ass_path, font_dir, audio_path, out_path, total_dur):
+def render_video(media, durs, ass_path, font_dir, audio_path, out_path, total_dur, music_path=None):
     n = len(media)
     T = TRANS_DUR
     cmd = [ffmpeg_exe(), "-y"]
@@ -658,6 +797,8 @@ def render_video(media, durs, ass_path, font_dir, audio_path, out_path, total_du
             )
     audio_idx = n
     cmd += ["-i", audio_path]
+    if music_path:
+        cmd += ["-stream_loop", "-1", "-i", music_path]
 
     cur = "v0"
     elapsed = 0.0
@@ -673,9 +814,26 @@ def render_video(media, durs, ass_path, font_dir, audio_path, out_path, total_du
     else:
         filters.append(f"[{cur}]format=yuv420p[vout]")
 
+    if music_path:
+        fade_start = max(0.0, total_dur - 2.0)
+        filters.append(f"[{audio_idx}:a]aresample=44100,aformat=channel_layouts=mono,asplit=2[vo][sc]")
+        filters.append(
+            f"[{audio_idx + 1}:a]aresample=44100,aformat=channel_layouts=mono,volume={MUSIC_GAIN},"
+            f"afade=t=in:st=0:d=1.5,afade=t=out:st={fade_start:.2f}:d=2[mu]"
+        )
+        # jab voice bol rahi ho tab music apne aap dheemi ho jaye
+        filters.append("[mu][sc]sidechaincompress=threshold=0.03:ratio=6:attack=20:release=400[duck]")
+        filters.append(
+            "[vo][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            "alimiter=limit=0.95:level=0,aformat=sample_rates=44100:channel_layouts=mono[aout]"
+        )
+        audio_map = "[aout]"
+    else:
+        audio_map = f"{audio_idx}:a"
+
     cmd += [
         "-filter_complex_threads", "1", "-filter_complex", ";".join(filters),
-        "-map", "[vout]", "-map", f"{audio_idx}:a",
+        "-map", "[vout]", "-map", audio_map,
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "29", "-threads", "1", "-x264-params", "rc-lookahead=0:ref=1:bframes=0:sync-lookahead=0", "-pix_fmt", "yuv420p", "-r", str(FPS),
         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_path
     ]
@@ -704,7 +862,10 @@ def run_video_job(job_id, script_text, title):
         os.makedirs(work_dir, exist_ok=True)
 
         job["msg"] = "Step 1/4: Voiceover ban raha hai (Hindi + awaaz)..."
-        audio_bytes, ext, hindi_text = make_voice(roman_text)
+        audio_bytes, ext, hindi_text, voice_note = make_voice(roman_text)
+        if voice_note:
+            warnings.append(voice_note)
+        job["voice"] = "Voice: Gemini (Charon) ✅" if ext == "wav" else "Voice: BACKUP voice ⚠️ (Gemini voice nahi chali)"
         audio_path = os.path.join(work_dir, "voice." + ext)
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
@@ -712,10 +873,12 @@ def run_video_job(job_id, script_text, title):
 
         job["msg"] = "Step 2/4: Scenes plan ho rahe hain aur stock photo/video dhoondhe ja rahe hain..."
         groups, durs = plan_scenes(roman_text, total_dur)
-        queries = get_scene_queries(groups, title)
+        queries, q_note = get_scene_queries(groups, title)
+        if q_note:
+            warnings.append(q_note)
         media = gather_media(queries, work_dir, warnings)
 
-        job["msg"] = "Step 3/4: Hindi captions bana rahe hain..."
+        job["msg"] = "Step 3/4: Hindi captions aur background music taiyar ho rahe hain..."
         family = ensure_font()
         ass_path = None
         if family:
@@ -724,9 +887,14 @@ def run_video_job(job_id, script_text, title):
         else:
             warnings.append("Hindi font download nahi hua, isliye captions nahi lage.")
 
-        job["msg"] = "Step 4/4: Video render ho raha hai (zoom + transitions + captions)..."
+        music_path, music_label = (None, "music band (MUSIC_ON = False)")
+        if MUSIC_ON:
+            music_path, music_label = ensure_music(warnings)
+        job["music"] = "Music: " + music_label
+
+        job["msg"] = "Step 4/4: Video render ho raha hai (zoom + transitions + captions + music)..."
         out_path = os.path.join(VIDEO_DIR, job_id + ".mp4")
-        render_video(media, durs, ass_path, FONT_DIR, audio_path, out_path, total_dur)
+        render_video(media, durs, ass_path, FONT_DIR, audio_path, out_path, total_dur, music_path)
 
         job["file"] = out_path
         job["status"] = "done"
@@ -801,9 +969,9 @@ Script likhne ke rules:
 
 SEO ke rules (YouTube search ke liye):
 - TITLE: 60 characters ke andar. Main keyword shuru mein (book ka naam aur 'Book Summary in Hindi' jaisa search term), saath mein curiosity ya number. Jhooth wala clickbait nahi, video mein jo hai wahi promise karo.
-- DESCRIPTION: pehli 2 lines (150 characters ke andar) mein main keyword aur hook ho, kyunki search mein wahi dikhti hain. Phir 2-3 lines mein video ka summary, aur end mein ek line: Like, Share, Comment aur Subscribe karna mat bhoolna. Author ka naam tabhi likho jab pakka pata ho.
+- DESCRIPTION: pehli 2 lines (150 characters ke andar) mein main keyword aur hook ho, kyunki search mein wahi dikhti hain. Phir 2-3 lines mein video ka summary, aur end mein ek line: Like, Share, Comment aur Subscribe karna mat bhoolna. Description ke end mein ek line Devanagari Hindi mein bhi do (jaise 'बुक समरी हिंदी में'), taaki Hindi search mein bhi dikhe. Author ka naam tabhi likho jab pakka pata ho.
 - HASHTAGS: {hashtag_rule}
-- TAGS: 10-12 search keywords, comma se alag, Hinglish aur English dono mix (jaise 'atomic habits summary in hindi', 'book summary hindi', 'best self help books'), kul 400 characters ke andar.
+- TAGS: 10-12 search keywords, comma se alag, Hinglish aur English dono mix (jaise 'atomic habits summary in hindi', 'book summary hindi', 'best self help books'), inme 3-4 tags Devanagari Hindi mein bhi ho, kul 400 characters ke andar.
 - PINNED COMMENT: 1-2 line ka sawaal jo log comment mein jawab dene ko majboor ho jayein.
 - THUMBNAIL TEXT: 3-5 words, badi akshar mein dikhne layak, curiosity wala.
 
@@ -838,6 +1006,22 @@ def parse_sections(text):
         end = matches[i + 1].start() if i + 1 < len(matches) else len(clean)
         sections[m.group(1).upper()] = clean[m.end():end].strip()
     return sections
+
+SEO_CSS = """
+            .seo { background: white; padding: 15px; margin-top: 20px; border-radius: 8px; }
+            .seo-item { margin-top: 14px; }
+            .seo-text { background: #f6f6f6; padding: 10px; border-radius: 6px; margin-top: 6px; white-space: pre-wrap; font-size: 14px; word-break: break-word; }
+            button.copy { margin-top: 8px; padding: 8px; background: #3498db; color: white; border: none; border-radius: 5px; width: 100%; font-size: 14px; }
+"""
+
+UPLOAD_SETTINGS = (
+    "Category: Education\n"
+    "Language: Hindi\n"
+    "Audience: No, it's not made for kids\n"
+    "Comments: Allow all\n"
+    "Altered/synthetic content: Studio ka sawaal padho aur sach jawab do (realistic asli insaan jaisa AI content ho toh Yes)\n"
+    "Visibility: pehle Unlisted/Private pe check karo, phir Public"
+)
 
 COPY_JS = """
 <script>
@@ -891,6 +1075,10 @@ def build_seo_cards(sections):
             "<div class='seo-text' id='seo" + str(i) + "'>" + html_lib.escape(value) + "</div>"
             "<button class='copy' type='button' onclick=\"copyText('seo" + str(i) + "', this)\">📋 Copy</button></div>"
         )
+    out += (
+        "<div class='seo-item'><b>⚙️ YouTube Studio upload settings</b>"
+        "<div class='seo-text'>" + html_lib.escape(UPLOAD_SETTINGS) + "</div></div>"
+    )
     out += "</div>" + COPY_JS
     return out
 
@@ -901,6 +1089,7 @@ def build_seo_cards(sections):
 @app.route("/dashboard/youtube", methods=["GET", "POST"])
 def youtube_script():
     script_result = None
+    error_msg = ""
     book_name = ""
     video_format = "short"
 
@@ -909,14 +1098,16 @@ def youtube_script():
         video_format = request.form.get("format", "short")
 
         prompt = build_script_prompt(book_name, video_format)
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
-        response = model.generate_content(prompt)
-        script_result = response.text
+        try:
+            script_result = gemini_text(prompt)
+        except Exception as e:
+            error_msg = "Script nahi ban payi: " + str(e)[:300]
 
     escaped_script = html_lib.escape(script_result) if script_result else ""
     escaped_book = html_lib.escape(book_name, quote=True)
     escaped_result = html_lib.escape(script_result) if script_result else ""
     seo_block = build_seo_cards(parse_sections(script_result)) if script_result else ""
+    error_html = f"<p style='background:#f8d7da;padding:10px;border-radius:6px;margin-top:20px;'>⚠️ {html_lib.escape(error_msg)}</p>" if error_msg else ""
 
     action_block = ""
     if script_result:
@@ -947,10 +1138,7 @@ def youtube_script():
             input[type=text], select {{ width: 100%; padding: 10px; margin-top: 5px; box-sizing: border-box; font-size: 16px; }}
             button {{ margin-top: 20px; padding: 12px; background: #28a745; color: white; border: none; border-radius: 5px; width: 100%; font-size: 16px; }}
             .result {{ background: white; padding: 15px; margin-top: 20px; border-radius: 8px; white-space: pre-wrap; font-size: 14px; line-height: 1.6; }}
-            .seo {{ background: white; padding: 15px; margin-top: 20px; border-radius: 8px; }}
-            .seo-item {{ margin-top: 14px; }}
-            .seo-text {{ background: #f6f6f6; padding: 10px; border-radius: 6px; margin-top: 6px; white-space: pre-wrap; font-size: 14px; word-break: break-word; }}
-            button.copy {{ margin-top: 8px; padding: 8px; background: #3498db; font-size: 14px; }}
+            {SEO_CSS}
         </style>
     </head>
     <body>
@@ -968,6 +1156,7 @@ def youtube_script():
 
             <button type="submit">Script Generate Karo</button>
         </form>
+        {error_html}
         {"<div class='result'>" + escaped_result + "</div>" if script_result else ""}
         {action_block}
         {seo_block}
@@ -985,13 +1174,14 @@ def youtube_audio():
     if not clean_text:
         return "Voiceover ke liye text nahi mila", 400
 
-    audio_bytes, ext, _ = make_voice(clean_text)
+    audio_bytes, ext, _, _ = make_voice(clean_text)
     mimetype = "audio/wav" if ext == "wav" else "audio/mpeg"
+    file_name = "voiceover.wav" if ext == "wav" else "voiceover_BACKUP_voice.mp3"
     return send_file(
         BytesIO(audio_bytes),
         mimetype=mimetype,
         as_attachment=True,
-        download_name="voiceover." + ext
+        download_name=file_name
     )
 
 # Video job shuru karo (background mein chalega)
@@ -1009,6 +1199,9 @@ def youtube_video_start():
         "msg": "Shuru ho raha hai...",
         "file": None,
         "note": "",
+        "voice": "",
+        "music": "",
+        "script_text": script_text,
         "start": time.time()
     }
     t = threading.Thread(
@@ -1040,6 +1233,9 @@ def youtube_video_status(job_id):
         <p>Yeh page apne aap refresh hota rahega. Ise band mat karna, free server pe isme 3-8 minute lag sakte hain.</p>
         """
     elif job["status"] == "done":
+        voice_line = html_lib.escape(job.get("voice", ""))
+        music_line = html_lib.escape(job.get("music", ""))
+        seo_html = build_seo_cards(parse_sections(job.get("script_text", "")))
         body = f"""
         <h3>✅ Video ready!</h3>
         <video controls playsinline style="width:100%;max-width:420px;border-radius:8px;">
@@ -1047,7 +1243,9 @@ def youtube_video_status(job_id):
         </video>
         <a class="dl" href="/dashboard/youtube/video/{job_id}/file?dl=1">⬇️ Video Download Karo</a>
         <p>Banane mein {elapsed} second lage.</p>
+        <p>🎙️ {voice_line}<br>🎵 {music_line}</p>
         {note_html}
+        {seo_html}
         """
     else:
         body = f"""
@@ -1065,6 +1263,7 @@ def youtube_video_status(job_id):
             body {{ font-family: Arial; background: #f0f2f5; padding: 20px; }}
             a.back {{ color: #007bff; text-decoration: none; font-size: 16px; }}
             a.dl {{ display: block; margin-top: 15px; padding: 12px; background: #28a745; color: white; text-align: center; border-radius: 5px; text-decoration: none; font-size: 16px; }}
+            {SEO_CSS}
         </style>
     </head>
     <body>
