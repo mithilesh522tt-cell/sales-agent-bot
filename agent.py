@@ -322,7 +322,7 @@ def to_devanagari(text):
     return out, True
 
 # Gemini TTS se natural male Hindi voice (WAV bytes return karta hai)
-def gemini_tts_wav(text):
+def gemini_tts_wav(text, timeout=90):
     url = "https://generativelanguage.googleapis.com/v1beta/interactions"
     headers = {
         "x-goog-api-key": os.environ.get("GEMINI_API_KEY"),
@@ -344,7 +344,7 @@ def gemini_tts_wav(text):
         "response_format": {"type": "audio"},
         "generation_config": {"speech_config": [{"voice": "Charon"}]}
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     r.raise_for_status()
     data = r.json()
 
@@ -915,9 +915,17 @@ def run_video_job(job_id, script_text, title):
 
 LW, LH = 854, 480          # Long video ka size (480p). Server tez ho toh 1280, 720 kar sakte ho
 LFPS = 10                  # frames per second (kam rakha hai taaki render tez ho)
-LONG_PART_CHARS = 700      # ek voice part mein lagbhag itne Hindi characters (~45 second)
+LONG_PART_CHARS = 700      # ek voice part mein kam se kam itne Hindi characters
+LONG_MAX_PART_CHARS = 4000 # ek voice request mein zyada se zyada itne characters (~4-5 minute ki awaaz)
+LONG_VOICE_ENGINE = "edge"  # "edge" = Microsoft Edge free voice (limit nahi). "gemini" = Gemini Charon (roz sirf 10 requests free)
+EDGE_VOICE = "hi-IN-MadhurNeural"   # ya "hi-IN-SwaraNeural" (female)
+EDGE_RATE = "-4%"          # thoda dheema = zyada natural (pehle backup +10% tha, isliye robotic lagta tha)
+EDGE_PITCH = "-2Hz"
+TTS_DAILY_LIMIT = 10       # Gemini TTS ki free limit: roz ki 10 requests (Render log se pata chala). Paid ho toh badha dena
 LONG_CONVERT_CHARS = 4500  # Hinglish se Hindi conversion ek baar mein itne characters
 LONG_BG_QUERY = "dark library bookshelf"
+LONG_ALLOW_BACKUP = False   # False = Gemini voice fail hui toh video wahin ruk jati hai aur asli error dikhati hai (robotic video nahi banti). True = backup voice se video poori banao
+LONG_TTS_GAP = 3            # do voice requests ke beech itne second ruko (limit se bachne ke liye)
 GOLD = (212, 175, 55)
 
 def long_font(size):
@@ -1043,18 +1051,60 @@ def render_long_part(base_png, audio_path, ass_path, font_dir, out_path, dur):
     if r.returncode != 0:
         raise RuntimeError("part render fail: " + r.stderr[-400:])
 
+def edge_natural_mp3(text, voice=None, rate=None, pitch=None):
+    buf = BytesIO()
+
+    async def go():
+        comm = edge_tts.Communicate(text, voice=voice or EDGE_VOICE, rate=rate or EDGE_RATE, pitch=pitch or EDGE_PITCH)
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                buf.write(chunk["data"])
+
+    asyncio.run(go())
+    data = buf.getvalue()
+    if not data:
+        raise RuntimeError("Edge se awaaz nahi aayi")
+    return data
+
 def long_voice_part(hindi_part):
-    # Voice wahi: Gemini TTS (Charon). Fail hone par ek baar retry, phir backup edge-tts. (audio_bytes, ext) return karta hai
+    if LONG_VOICE_ENGINE == "edge":
+        err = ""
+        for attempt in range(3):
+            try:
+                return edge_natural_mp3(hindi_part), "mp3", ""
+            except Exception as e:
+                err = str(e)[:150]
+                print("Long Edge voice fail:", err)
+                time.sleep(3)
+        return None, None, "Edge voice fail: " + err
+    # Voice wahi: Gemini TTS (Charon). Rate-limit par ruk ruk ke 4 baar try. (audio_bytes, ext, error_text) return karta hai
     last_err = ""
-    for attempt in range(2):
+    waits = [20, 45, 90]
+    for attempt in range(4):
         try:
-            return gemini_tts_wav(hindi_part), "wav"
+            return gemini_tts_wav(hindi_part, timeout=300), "wav", ""
         except Exception as e:
             last_err = describe_error(e)
-            print("Long TTS fail:", last_err)
-            if attempt == 0:
-                time.sleep(6)
-    return edge_tts_mp3_bytes(hindi_part), "mp3"
+            full = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    full = resp.text.lower()
+                except Exception:
+                    pass
+            print("Long TTS fail (attempt %d): %s" % (attempt + 1, last_err))
+            if "perday" in full.replace(" ", "") or "per day" in full or "daily" in full:
+                last_err = "Gemini ki roz ki free limit khatam: " + last_err
+                break
+            if attempt < len(waits):
+                wait = waits[attempt]
+                m = re.search(r"retry in ([0-9.]+)s", full)
+                if m:
+                    wait = min(120, int(float(m.group(1))) + 3)
+                time.sleep(wait)
+    if LONG_ALLOW_BACKUP:
+        return edge_natural_mp3(hindi_part), "mp3", last_err
+    return None, None, last_err
 
 def add_music_to_video(joined, music_path, out_path, total_dur):
     fade_start = max(0.0, total_dur - 3.0)
@@ -1109,8 +1159,23 @@ def run_long_video_job(job_id, script_text, title):
                 conv_fail += 1
         if conv_fail:
             warnings.append(f"{conv_fail} hisse ka Hindi conversion fail hua, wahan voice Roman text se bani (quality kam ho sakti hai).")
-        parts = split_chunks(" ".join(hindi_pieces), LONG_PART_CHARS)
-        n = len(parts)
+        use_gemini = (LONG_VOICE_ENGINE != "edge")
+        full_hindi = " ".join(hindi_pieces)
+        if not use_gemini:
+            parts = split_chunks(full_hindi, 900)
+            n = len(parts)
+            job["voice"] = f"Voice: Edge {EDGE_VOICE} (free, bina limit)"
+        else:
+            est_parts = max(1, -(-len(full_hindi) // LONG_MAX_PART_CHARS))
+            if est_parts > TTS_DAILY_LIMIT:
+                max_min = int(TTS_DAILY_LIMIT * LONG_MAX_PART_CHARS / 15.5 / 60)
+                raise ValueError(f"Is video ke liye lagbhag {est_parts} voice requests chahiye, par Gemini ki free limit {TTS_DAILY_LIMIT} requests/din hai. "
+                                 f"Video ko lagbhag {max_min} minute tak rakho ya kal dobara try karo.")
+            # voice requests kam se kam rakho: poori script ko est_parts hisson mein baanto
+            part_chars = max(LONG_PART_CHARS, int(len(full_hindi) / est_parts * 1.08) + 1)
+            parts = split_chunks(full_hindi, part_chars)
+            n = len(parts)
+            job["voice"] = f"Voice requests: {n} (Gemini free limit {TTS_DAILY_LIMIT}/din)"
         if n == 0:
             raise ValueError("Script se voice ke hisse nahi bane")
 
@@ -1118,7 +1183,7 @@ def run_long_video_job(job_id, script_text, title):
         base_png = os.path.join(work_dir, "base.png")
         build_long_base(base_png, title, work_dir, warnings)
 
-        part_files, total_dur, backup_parts = [], 0.0, 0
+        part_files, total_dur, backup_parts, last_tts_err = [], 0.0, 0, ""
         started = time.time()
         for i, part in enumerate(parts, 1):
             eta = ""
@@ -1126,9 +1191,14 @@ def run_long_video_job(job_id, script_text, title):
                 per = (time.time() - started) / (i - 1)
                 eta = f" (baaki lagbhag {int(per * (n - i + 1) / 60) + 1} minute)"
             job["msg"] = f"Step 3/4: Part {i}/{n} ban raha hai (voice + video){eta}"
-            audio, ext = long_voice_part(part)
-            if ext != "wav":
-                backup_parts += 1
+            audio, ext, tts_err = long_voice_part(part)
+            if audio is None:
+                raise RuntimeError(f"Part {i}/{n}: voice nahi bani. Error: {tts_err}")
+            if use_gemini:
+                if ext != "wav":
+                    backup_parts += 1
+                    last_tts_err = tts_err
+                time.sleep(LONG_TTS_GAP)
             apath = os.path.join(work_dir, f"a{i}.{ext}")
             with open(apath, "wb") as f:
                 f.write(audio)
@@ -1144,10 +1214,11 @@ def run_long_video_job(job_id, script_text, title):
             for tmp in (apath, ass_path):
                 if tmp and os.path.exists(tmp):
                     os.remove(tmp)
-            job["voice"] = ("Voice: Gemini (Charon) ✅" if backup_parts == 0
-                            else f"Voice: {backup_parts}/{i} part BACKUP voice ⚠️ (Gemini voice nahi chali)")
+            if use_gemini:
+                job["voice"] = ("Voice: Gemini (Charon) ✅" if backup_parts == 0
+                                else f"Voice: {backup_parts}/{i} part BACKUP voice ⚠️ (Gemini voice nahi chali)")
         if backup_parts:
-            warnings.append(f"{backup_parts} part mein Gemini voice fail hui, wahan backup voice lagi.")
+            warnings.append(f"{backup_parts} part mein Gemini voice fail hui, wahan backup voice lagi. Error: {last_tts_err}")
 
         job["msg"] = "Step 4/4: Saare parts jodke final video ban rahi hai..."
         list_path = os.path.join(work_dir, "list.txt")
@@ -1197,7 +1268,12 @@ def run_long_video_job(job_id, script_text, title):
 # Channel ka naam jab decide ho jaye yahan likh dena (khali rahega toh video mein bas "channel" bola jayega)
 CHANNEL_NAME = "Book Secrets Hindi"
 
-def build_script_prompt(book_name, video_format):
+def build_script_prompt(book_name, video_format, minutes=35):
+    minutes = max(2, min(45, int(minutes)))
+    target_words = minutes * 125
+    max_words = int(target_words * 1.1)
+    n_ch = max(2, min(12, round(minutes / 4)))
+    ch_words = int(target_words * 0.8 / n_ch)
     if CHANNEL_NAME:
         subscribe_line = f"'{CHANNEL_NAME}' channel ko subscribe karne ki baat bolo"
     else:
@@ -1227,11 +1303,11 @@ def build_script_prompt(book_name, video_format):
         hashtag_rule = "3 se 5 hashtags, sabse zaroori pehle (YouTube pehle 3 title ke upar dikhata hai), aur aakhri hashtag #Shorts ho."
     else:
         length_instruction = (
-            "Yeh ek LONG YouTube video hai. Voiceover lagbhag 35-40 minute ka ho, yaani kam se kam 4500 words aur 5000 words tak. "
+            f"Yeh ek LONG YouTube video hai. Voiceover lagbhag {minutes} minute ka ho, yaani kam se kam {target_words} words aur {max_words} words tak. "
             "Script chhoti mat karna, poori lambi likhna, aur saare chapters ek hi baar mein likhna. Structure yeh rakho:\n"
             "1) HOOK: pehle 15 second mein chonkane wala sach ya sawaal, aur promise ki end mein ek bada twist milega.\n"
             "2) OPEN LOOP: hook ke baad batao ki end mein ek aisi baat khulegi jo sab badal degi.\n"
-            "3) 8-10 CHAPTERS: har chapter kam se kam 450 words ka. Har chapter mein ek relatable scene ya chhoti kahani, "
+            f"3) {n_ch} CHAPTERS: har chapter kam se kam {ch_words} words ka. Har chapter mein ek relatable scene ya chhoti kahani, "
             "book ka ek bada idea apne shabdon mein, ek real-life example, aur chapter ke end mein ek naya cliffhanger.\n"
             "4) Beech mein ek mini twist ho, taaki sunne wala aadhe video mein chhod ke na jaye. "
             "Har 2-3 chapters ke baad ek chhoti line: 'agar ab tak pasand aa raha hai toh like kar do'.\n"
@@ -1386,12 +1462,19 @@ def youtube_script():
     error_msg = ""
     book_name = ""
     video_format = "short"
+    minutes = 35
 
     if request.method == "POST":
         book_name = request.form.get("book_name", "")
         video_format = request.form.get("format", "short")
+        try:
+            raw_min = request.form.get("minutes", "").strip()
+            minutes = int(float(raw_min)) if raw_min else 35
+        except Exception:
+            minutes = 35
+        minutes = max(2, min(45, minutes))
 
-        prompt = build_script_prompt(book_name, video_format)
+        prompt = build_script_prompt(book_name, video_format, minutes)
         try:
             script_result = gemini_text(prompt)
         except Exception as e:
@@ -1451,8 +1534,19 @@ def youtube_script():
             <label>Video format</label>
             <select name="format">
                 <option value="short" {"selected" if video_format=="short" else ""}>Short (45-60 sec, vertical)</option>
-                <option value="long" {"selected" if video_format=="long" else ""}>Long (35-40 min, horizontal)</option>
+                <option value="long" {"selected" if video_format=="long" else ""}>Long (aap minute chuno, horizontal)</option>
             </select>
+
+            <div id="minwrap" style="display:{'block' if video_format=='long' else 'none'};">
+                <label>Video kitne minute ki chahiye? (2 se 45)</label>
+                <input type="number" name="minutes" min="2" max="45" value="{minutes}" placeholder="jaise: 10"
+                       style="width:100%;padding:12px;margin-top:6px;border:1px solid #ccc;border-radius:5px;font-size:16px;box-sizing:border-box;">
+            </div>
+            <script>
+                document.querySelector('select[name=format]').addEventListener('change', function() {{
+                    document.getElementById('minwrap').style.display = (this.value === 'long') ? 'block' : 'none';
+                }});
+            </script>
 
             <button type="submit">Script Generate Karo</button>
         </form>
@@ -1511,6 +1605,44 @@ def youtube_video_start():
     )
     t.start()
     return redirect("/dashboard/youtube/video/" + job_id)
+
+# Voice test: alag alag Edge voices phone par sunke chuno
+VOICE_TEST_TEXT = "दोस्तों, सोचिए। क्या आप जानते हैं कि हर कामयाब इंसान के पीछे एक छिपा हुआ राज़ होता है? लेकिन ठहरिए। असली खेल अभी बाकी है।"
+VOICE_PRESETS = [
+    ("Madhur (male) -4% pitch -2Hz  [abhi ka default]", "hi-IN-MadhurNeural", "-4%", "-2Hz"),
+    ("Madhur (male) normal speed", "hi-IN-MadhurNeural", "+0%", "+0Hz"),
+    ("Madhur (male) -8% pitch -4Hz (gehri awaaz)", "hi-IN-MadhurNeural", "-8%", "-4Hz"),
+    ("Swara (female) -4%", "hi-IN-SwaraNeural", "-4%", "+0Hz"),
+    ("Swara (female) normal speed", "hi-IN-SwaraNeural", "+0%", "+0Hz"),
+]
+
+@app.route("/dashboard/voicetest")
+def voice_test_page():
+    rows = ""
+    for label, v, r, p in VOICE_PRESETS:
+        q = f"voice={v}&rate={r.replace('+', '%2B')}&pitch={p.replace('+', '%2B')}"
+        rows += f"<p><b>{label}</b><br><audio controls preload='none' src='/dashboard/voicetest/audio?{q}' style='width:100%'></audio></p>"
+    return f"""<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>body{{font-family:sans-serif;padding:20px;max-width:600px;margin:auto;}}</style></head><body>
+    <a href="/dashboard">&larr; Back</a>
+    <h2>🎙️ Edge Voice Test</h2>
+    <p>Har ek par play dabake suno (pehli baar 3-5 second lag sakte hain). Jo pasand aaye, uske baare mein mujhe batao.</p>
+    <p style="color:#666;font-size:14px;">Sample: {VOICE_TEST_TEXT}</p>
+    {rows}</body></html>"""
+
+@app.route("/dashboard/voicetest/audio")
+def voice_test_audio():
+    from flask import Response
+    voice = request.args.get("voice", EDGE_VOICE)
+    if voice not in ("hi-IN-MadhurNeural", "hi-IN-SwaraNeural"):
+        voice = EDGE_VOICE
+    rate = request.args.get("rate", EDGE_RATE).replace(" ", "+")
+    pitch = request.args.get("pitch", EDGE_PITCH).replace(" ", "+")
+    try:
+        data = edge_natural_mp3(VOICE_TEST_TEXT, voice, rate, pitch)
+    except Exception as e:
+        return "Voice nahi bani: " + str(e)[:200], 500
+    return Response(data, mimetype="audio/mpeg")
 
 # Long video job shuru karo (background mein chalega)
 @app.route("/dashboard/youtube/longvideo", methods=["POST"])
@@ -1620,4 +1752,3 @@ init_db()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
