@@ -956,9 +956,8 @@ def build_script_prompt(book_name, video_format):
             "6) ENDING: ek line ka takeaway, phir call to action. " + cta_rule
         )
         hashtag_rule = "3 se 5 hashtags, sabse zaroori pehle (YouTube pehle 3 title ke upar dikhata hai)."
-        
+
     return f"""Tum ek top YouTube scriptwriter aur SEO expert ho jo books ko Hindi (Hinglish, Roman letters) mein suspense ke saath explain karta hai. Tumhari script ka kaam yeh hai ki dekhne wala beech mein video chhodke na jaye, aur video YouTube search mein dikhe.
-return f"""Tum ek top YouTube scriptwriter aur SEO expert ho jo books ko Hindi (Hinglish, Roman letters) mein suspense ke saath explain karta hai. Tumhari script ka kaam yeh hai ki dekhne wala beech mein video chhodke na jaye, aur video YouTube search mein dikhe.
 
 Book: {book_name}
 
@@ -970,7 +969,7 @@ Script likhne ke rules:
 - Koi emoji, bullet list, markdown, ya brackets mein stage directions mat likho. Sirf wahi text likho jo bola jayega.
 - Book ke concepts apne shabdon mein samjhao. Book ke asli ideas hi use karo. Jhoothe statistics, nakli quotes ya banaye hue kisse mat likho.
 - HOOK mein jo lines likho unhe SCRIPT mein dobara mat likhna, SCRIPT wahin se aage badhe.
-- CHANNEL KA NAAM: "{book secrets Hindi }" bilkul 2 baar bolo. Pehli baar open loop ke baad ek chhoti line mein, jaise koi dost raaz khol raha ho: "{CHANNEL_NAME} par hum yahi chhupe raaz kholte hain." Doosri baar ending mein subscribe ke saath. HOOK mein channel ka naam mat lo.
+- CHANNEL KA NAAM: "{CHANNEL_NAME}" bilkul 2 baar bolo. Pehli baar open loop ke baad ek chhoti line mein, jaise koi dost raaz khol raha ho: "{CHANNEL_NAME} par hum yahi chhupe raaz kholte hain." Doosri baar ending mein subscribe ke saath. HOOK mein channel ka naam mat lo.
 - HOOK ki taakat: pehli line aisi ho ki kaan khade ho jayein. Ya toh ek shocking sach, ya ek ulta sawaal, ya ek chhota dramatic scene. Seedha 'aap' se baat karo, jaise aapki hi baat ho rahi hai.
 - SUSPENSE: har point ke end mein ek alag cliffhanger line do, jaise "Lekin yahan kahani palat jaati hai." ya "Par asli khel abhi baaki hai." Ek hi line baar baar repeat mat karo. Beech mein ek baar sunne wale ko rok do ek sawaal se, jaise "Ab sochiye, aap hote toh kya karte?"
 - SCENE: ek point mein aam zindagi ka relatable scene dikhao, jaise "Raat ke do baje, aap phone scroll kar rahe ho." Isse sunne wale ko lage ki yeh uski hi kahani hai. Kisi asli insaan ya jhoothe aankdon ka naam mat banao.
@@ -986,36 +985,6 @@ SEO ke rules (YouTube search aur click ke liye):
 - TAGS: 12-15 search keywords, comma se alag, Hinglish aur English mix. Inme book ka naam + 'summary in hindi', 'book summary hindi', 'book secrets hindi', 'best self help books hindi' jaise tags ho, aur 3-4 tags Devanagari Hindi mein. Kul 400 characters ke andar.
 - PINNED COMMENT: 1-2 line ka ek specific sawaal jo book ke twist se juda ho, taaki log apna jawab likhne ko majboor ho jayein. Aakhir mein 'Agla raaz kaunsi book ka chahiye?' jaisi line jodo.
 - THUMBNAIL TEXT: 3-5 words, badi akshar mein dikhne layak, hook se mile hue, curiosity wale. Koi emoji nahi.
-
-Format bilkul yahi rakho, isi order mein (headings ke naam mat badalna):
-
-TITLE: (title)
-
-HOOK: (pehli 1-2 chonkane wali lines, jo video ke shuru mein bolenge)
-
-SCRIPT:
-(hook ke baad ka poora script: open loop, points, twist, ending aur call to action)
-
-DESCRIPTION: (description)
-
-HASHTAGS: (hashtags)
-
-TAGS: (comma se alag keywords)
-
-PINNED COMMENT: (comment)
-
-THUMBNAIL TEXT: (text)
-"""
-
-SEO ke rules (YouTube search aur click ke liye):
-
-SEO ke rules (YouTube search ke liye):
-- TITLE: 60 characters ke andar. Main keyword shuru mein (book ka naam aur 'Book Summary in Hindi' jaisa search term), saath mein curiosity ya number. Jhooth wala clickbait nahi, video mein jo hai wahi promise karo.
-- DESCRIPTION: pehli 2 lines (150 characters ke andar) mein main keyword aur hook ho, kyunki search mein wahi dikhti hain. Phir 2-3 lines mein video ka summary, aur end mein ek line: Like, Share, Comment aur Subscribe karna mat bhoolna. Description ke end mein ek line Devanagari Hindi mein bhi do (jaise 'बुक समरी हिंदी में'), taaki Hindi search mein bhi dikhe. Author ka naam tabhi likho jab pakka pata ho.
-- HASHTAGS: {hashtag_rule}
-- TAGS: 10-12 search keywords, comma se alag, Hinglish aur English dono mix (jaise 'atomic habits summary in hindi', 'book summary hindi', 'best self help books'), inme 3-4 tags Devanagari Hindi mein bhi ho, kul 400 characters ke andar.
-- PINNED COMMENT: 1-2 line ka sawaal jo log comment mein jawab dene ko majboor ho jayein.
-- THUMBNAIL TEXT: 3-5 words, badi akshar mein dikhne layak, curiosity wala.
 
 Format bilkul yahi rakho, isi order mein (headings ke naam mat badalna):
 
