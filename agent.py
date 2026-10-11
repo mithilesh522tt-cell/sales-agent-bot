@@ -912,7 +912,7 @@ def run_video_job(job_id, script_text, title):
 # ---------------------------------------------------------------
 
 # Channel ka naam jab decide ho jaye yahan likh dena (khali rahega toh video mein bas "channel" bola jayega)
-CHANNEL_NAME = ""
+CHANNEL_NAME = "Book Secrets Hindi"
 
 def build_script_prompt(book_name, video_format):
     if CHANNEL_NAME:
@@ -944,17 +944,21 @@ def build_script_prompt(book_name, video_format):
         hashtag_rule = "3 se 5 hashtags, sabse zaroori pehle (YouTube pehle 3 title ke upar dikhata hai), aur aakhri hashtag #Shorts ho."
     else:
         length_instruction = (
-            "Yeh ek LONG YouTube video hai, voiceover lagbhag 7-10 minute ka. Structure yeh rakho:\n"
+            "Yeh ek LONG YouTube video hai. Voiceover lagbhag 35-40 minute ka ho, yaani kam se kam 4500 words aur 5000 words tak. "
+            "Script chhoti mat karna, poori lambi likhna, aur saare chapters ek hi baar mein likhna. Structure yeh rakho:\n"
             "1) HOOK: pehle 15 second mein chonkane wala sach ya sawaal, aur promise ki end mein ek bada twist milega.\n"
-            "2) 5-7 lessons, har lesson ek chhoti kahani ya real-life example ke saath, apne shabdon mein.\n"
-            "3) Har 1-2 lessons ke baad ek naya open loop ('lekin isse bhi badi galti aage aa rahi hai'). "
-            "Beech mein ek baar chhota sa 'agar ab tak pasand aa raha hai toh like kar do' bolo.\n"
-            "4) Aakhir se pehle bada TWIST jo poori video ki soch palat de, aur shuru ke promise ka jawab de.\n"
-            "5) ENDING: takeaway, phir call to action. " + cta_rule
+            "2) OPEN LOOP: hook ke baad batao ki end mein ek aisi baat khulegi jo sab badal degi.\n"
+            "3) 8-10 CHAPTERS: har chapter kam se kam 450 words ka. Har chapter mein ek relatable scene ya chhoti kahani, "
+            "book ka ek bada idea apne shabdon mein, ek real-life example, aur chapter ke end mein ek naya cliffhanger.\n"
+            "4) Beech mein ek mini twist ho, taaki sunne wala aadhe video mein chhod ke na jaye. "
+            "Har 2-3 chapters ke baad ek chhoti line: 'agar ab tak pasand aa raha hai toh like kar do'.\n"
+            "5) Aakhir se pehle bada TWIST jo poori video ki soch palat de, aur shuru ke open loop ka poora jawab de.\n"
+            "6) ENDING: ek line ka takeaway, phir call to action. " + cta_rule
         )
         hashtag_rule = "3 se 5 hashtags, sabse zaroori pehle (YouTube pehle 3 title ke upar dikhata hai)."
-
+        
     return f"""Tum ek top YouTube scriptwriter aur SEO expert ho jo books ko Hindi (Hinglish, Roman letters) mein suspense ke saath explain karta hai. Tumhari script ka kaam yeh hai ki dekhne wala beech mein video chhodke na jaye, aur video YouTube search mein dikhe.
+return f"""Tum ek top YouTube scriptwriter aur SEO expert ho jo books ko Hindi (Hinglish, Roman letters) mein suspense ke saath explain karta hai. Tumhari script ka kaam yeh hai ki dekhne wala beech mein video chhodke na jaye, aur video YouTube search mein dikhe.
 
 Book: {book_name}
 
@@ -966,6 +970,44 @@ Script likhne ke rules:
 - Koi emoji, bullet list, markdown, ya brackets mein stage directions mat likho. Sirf wahi text likho jo bola jayega.
 - Book ke concepts apne shabdon mein samjhao. Book ke asli ideas hi use karo. Jhoothe statistics, nakli quotes ya banaye hue kisse mat likho.
 - HOOK mein jo lines likho unhe SCRIPT mein dobara mat likhna, SCRIPT wahin se aage badhe.
+- CHANNEL KA NAAM: "{book secrets Hindi }" bilkul 2 baar bolo. Pehli baar open loop ke baad ek chhoti line mein, jaise koi dost raaz khol raha ho: "{CHANNEL_NAME} par hum yahi chhupe raaz kholte hain." Doosri baar ending mein subscribe ke saath. HOOK mein channel ka naam mat lo.
+- HOOK ki taakat: pehli line aisi ho ki kaan khade ho jayein. Ya toh ek shocking sach, ya ek ulta sawaal, ya ek chhota dramatic scene. Seedha 'aap' se baat karo, jaise aapki hi baat ho rahi hai.
+- SUSPENSE: har point ke end mein ek alag cliffhanger line do, jaise "Lekin yahan kahani palat jaati hai." ya "Par asli khel abhi baaki hai." Ek hi line baar baar repeat mat karo. Beech mein ek baar sunne wale ko rok do ek sawaal se, jaise "Ab sochiye, aap hote toh kya karte?"
+- SCENE: ek point mein aam zindagi ka relatable scene dikhao, jaise "Raat ke do baje, aap phone scroll kar rahe ho." Isse sunne wale ko lage ki yeh uski hi kahani hai. Kisi asli insaan ya jhoothe aankdon ka naam mat banao.
+- RHYTHM: chhote tez vakya, beech mein 2-3 words ka jhatka, jaise "Sach? Bilkul ulta." Phir ek shaant vakya. Isi tarah sunne wale ka dil upar neeche hota rahe.
+- TWIST: end se pehle aisa palat ho ki sunne wale ko lage "arre, yeh toh maine socha hi nahi tha." Twist book ke asli idea se nikle, aur shuru ke open loop ka poora jawab de.
+- ENDING: ek line ka takeaway jo yaad reh jaye. Phir call to action. Aakhri line mein agle raaz ka ishaara do, jaise "Agla raaz isse bhi bada hai." Taaki log aur videos dekhne ruke.
+- BHASHA: aasaan Hinglish, bhaari shabd nahi, kyunki awaaz saaf bolni chahiye.
+
+SEO ke rules (YouTube search aur click ke liye):
+- TITLE: 60 characters ke andar. Shuru mein main keyword (book ka naam + 'Book Summary in Hindi' ya 'Hindi Mein'), saath mein ek number ya curiosity (jaise '3 Raaz', 'Sach Jo Koi Nahi Batata'). Jhooth wala clickbait nahi, jo video mein hai wahi promise karo.
+- DESCRIPTION: pehli 2 lines (150 characters ke andar) mein book ka naam, 'Book Summary in Hindi' aur hook ho, kyunki search mein wahi dikhti hain. Phir 3-4 lines mein video ka summary, ek line mein "{CHANNEL_NAME}" ke naam ke saath channel ki pehchaan (jaise 'Roz ek book ka raaz Hindi mein'). Phir ek line: Like, Share, Comment aur Subscribe karna mat bhoolna. End mein ek line Devanagari Hindi mein (jaise 'बुक समरी हिंदी में'). Author ka naam tabhi likho jab pakka pata ho.
+- HASHTAGS: {hashtag_rule}
+- TAGS: 12-15 search keywords, comma se alag, Hinglish aur English mix. Inme book ka naam + 'summary in hindi', 'book summary hindi', 'book secrets hindi', 'best self help books hindi' jaise tags ho, aur 3-4 tags Devanagari Hindi mein. Kul 400 characters ke andar.
+- PINNED COMMENT: 1-2 line ka ek specific sawaal jo book ke twist se juda ho, taaki log apna jawab likhne ko majboor ho jayein. Aakhir mein 'Agla raaz kaunsi book ka chahiye?' jaisi line jodo.
+- THUMBNAIL TEXT: 3-5 words, badi akshar mein dikhne layak, hook se mile hue, curiosity wale. Koi emoji nahi.
+
+Format bilkul yahi rakho, isi order mein (headings ke naam mat badalna):
+
+TITLE: (title)
+
+HOOK: (pehli 1-2 chonkane wali lines, jo video ke shuru mein bolenge)
+
+SCRIPT:
+(hook ke baad ka poora script: open loop, points, twist, ending aur call to action)
+
+DESCRIPTION: (description)
+
+HASHTAGS: (hashtags)
+
+TAGS: (comma se alag keywords)
+
+PINNED COMMENT: (comment)
+
+THUMBNAIL TEXT: (text)
+"""
+
+SEO ke rules (YouTube search aur click ke liye):
 
 SEO ke rules (YouTube search ke liye):
 - TITLE: 60 characters ke andar. Main keyword shuru mein (book ka naam aur 'Book Summary in Hindi' jaisa search term), saath mein curiosity ya number. Jhooth wala clickbait nahi, video mein jo hai wahi promise karo.
