@@ -908,6 +908,289 @@ def run_video_job(job_id, script_text, title):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 # ---------------------------------------------------------------
+# LONG VIDEO (book card + waveform + Hindi captions) - 16:9
+# Short wale code ko yeh bilkul nahi chhedta. Voice wahi hai (Gemini Charon, backup edge-tts).
+# Video chhote chhote hisson (parts) mein banti hai, phir jud jati hai, taaki free server ki memory na bhare.
+# ---------------------------------------------------------------
+
+LW, LH = 854, 480          # Long video ka size (480p). Server tez ho toh 1280, 720 kar sakte ho
+LFPS = 10                  # frames per second (kam rakha hai taaki render tez ho)
+LONG_PART_CHARS = 700      # ek voice part mein lagbhag itne Hindi characters (~45 second)
+LONG_CONVERT_CHARS = 4500  # Hinglish se Hindi conversion ek baar mein itne characters
+LONG_BG_QUERY = "dark library bookshelf"
+GOLD = (212, 175, 55)
+
+def long_font(size):
+    from PIL import ImageFont as _IF
+    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"]:
+        if os.path.exists(p):
+            try:
+                return _IF.truetype(p, size)
+            except Exception:
+                pass
+    try:
+        return _IF.load_default(size=size)
+    except Exception:
+        return _IF.load_default()
+
+def wrap_text(draw, text, font, max_w):
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        if draw.textlength(t, font=font) <= max_w or not cur:
+            cur = t
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+def build_long_base(path, book_title, work_dir, warnings):
+    from PIL import ImageDraw, ImageFilter, ImageEnhance
+    bg = None
+    if os.environ.get("PEXELS_API_KEY"):
+        try:
+            data = pexels_get("https://api.pexels.com/v1/search",
+                              {"query": LONG_BG_QUERY, "orientation": "landscape", "per_page": 5})
+            photos = data.get("photos", [])
+            if photos:
+                raw = os.path.join(work_dir, "bg_raw.jpg")
+                download_file(photos[0]["src"].get("large2x") or photos[0]["src"]["large"], raw, max_mb=8)
+                bg = Image.open(raw).convert("RGB")
+        except Exception as e:
+            print("Long bg fetch fail:", e)
+    if bg is None:
+        warnings.append("Background photo nahi mili, isliye simple dark background laga.")
+        bg = Image.new("RGB", (LW, LH), (30, 20, 14))
+    scale = max(LW / bg.width, LH / bg.height)
+    bg = bg.resize((int(bg.width * scale) + 1, int(bg.height * scale) + 1), Image.LANCZOS)
+    left, top = (bg.width - LW) // 2, (bg.height - LH) // 2
+    bg = bg.crop((left, top, left + LW, top + LH)).filter(ImageFilter.GaussianBlur(2))
+    bg = ImageEnhance.Brightness(bg).enhance(0.38)
+
+    cw, ch = 230, 330
+    cx, cy = 36, (LH - ch) // 2
+    shadow = Image.new("RGBA", (LW, LH), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle((cx + 6, cy + 8, cx + cw + 6, cy + ch + 8), 14, fill=(0, 0, 0, 170))
+    bg = Image.alpha_composite(bg.convert("RGBA"), shadow.filter(ImageFilter.GaussianBlur(8)))
+    d = ImageDraw.Draw(bg)
+    d.rounded_rectangle((cx, cy, cx + cw, cy + ch), 14, fill=(26, 18, 12), outline=GOLD, width=4)
+    d.rounded_rectangle((cx + 10, cy + 10, cx + cw - 10, cy + ch - 10), 8, outline=(120, 98, 30), width=1)
+
+    f_small, f_big = long_font(15), long_font(30)
+    brand = (CHANNEL_NAME or "BOOK SUMMARY").upper()
+    bw = d.textlength(brand, font=f_small)
+    d.text((cx + (cw - bw) / 2, cy + 26), brand, font=f_small, fill=GOLD)
+    d.line((cx + 40, cy + 54, cx + cw - 40, cy + 54), fill=GOLD, width=2)
+    lines = wrap_text(d, (book_title or "Book Summary").upper(), f_big, cw - 40)[:5]
+    lh = 38
+    y = cy + 70 + max(0, (5 - len(lines)) * lh // 2)
+    for ln in lines:
+        lw_ = d.textlength(ln, font=f_big)
+        d.text((cx + (cw - lw_) / 2, y), ln, font=f_big, fill=(255, 255, 255))
+        y += lh
+    d.line((cx + 40, cy + ch - 62, cx + cw - 40, cy + ch - 62), fill=GOLD, width=2)
+    sub = "BOOK SUMMARY IN HINDI"
+    sw = d.textlength(sub, font=f_small)
+    d.text((cx + (cw - sw) / 2, cy + ch - 46), sub, font=f_small, fill=GOLD)
+    bg.convert("RGB").save(path, "PNG")
+
+LONG_CAP_X = 300           # caption/waveform area left edge
+LONG_WAVE_Y = 335
+
+def build_long_ass(hindi_text, total_dur, font_family, path):
+    chunks = split_chunks(hindi_text, 30)
+    total_len = sum(len(c) for c in chunks) or 1
+    mr = 36
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {LW}", f"PlayResY: {LH}", "WrapStyle: 0", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Cap,{font_family},34,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,2,1,8,{LONG_CAP_X},{mr},125,1",
+        "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    t = 0.0
+    for c in chunks:
+        dur = total_dur * len(c) / total_len
+        txt = c.replace("{", "(").replace("}", ")").replace("\n", " ")
+        lines.append(f"Dialogue: 0,{ass_time(t)},{ass_time(t + dur)},Cap,,0,0,0,,{{\\fad(100,60)}}{txt}")
+        t += dur
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+def render_long_part(base_png, audio_path, ass_path, font_dir, out_path, dur):
+    wave_w, wave_h = LW - LONG_CAP_X - 36, 100
+    fc = (
+        f"[0:v]format=yuv420p[bg];"
+        f"[1:a]aresample=44100,aformat=channel_layouts=mono,asplit=2[a1][a2];"
+        f"[a2]showfreqs=s={wave_w}x{wave_h}:mode=bar:fscale=log:ascale=sqrt:win_size=1024:rate={LFPS}:averaging=3:colors=white[wv];"
+        f"[bg][wv]overlay={LONG_CAP_X}:{LONG_WAVE_Y}:format=auto[ov]"
+    )
+    if ass_path:
+        fc += f";[ov]subtitles=filename='{ass_path}':fontsdir='{font_dir}'[vout]"
+    else:
+        fc += ";[ov]null[vout]"
+    cmd = [ffmpeg_exe(), "-y", "-loop", "1", "-framerate", str(LFPS), "-i", base_png, "-i", audio_path,
+           "-filter_complex_threads", "1", "-filter_complex", fc,
+           "-map", "[vout]", "-map", "[a1]", "-t", f"{dur:.3f}",
+           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-threads", "1",
+           "-x264-params", "rc-lookahead=0:ref=1:bframes=0:sync-lookahead=0", "-pix_fmt", "yuv420p", "-r", str(LFPS),
+           "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "1", "-movflags", "+faststart", out_path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("part render fail: " + r.stderr[-400:])
+
+def long_voice_part(hindi_part):
+    # Voice wahi: Gemini TTS (Charon). Fail hone par ek baar retry, phir backup edge-tts. (audio_bytes, ext) return karta hai
+    last_err = ""
+    for attempt in range(2):
+        try:
+            return gemini_tts_wav(hindi_part), "wav"
+        except Exception as e:
+            last_err = describe_error(e)
+            print("Long TTS fail:", last_err)
+            if attempt == 0:
+                time.sleep(6)
+    return edge_tts_mp3_bytes(hindi_part), "mp3"
+
+def add_music_to_video(joined, music_path, out_path, total_dur):
+    fade_start = max(0.0, total_dur - 3.0)
+    fc = (
+        "[0:a]aresample=44100,aformat=channel_layouts=mono,asplit=2[vo][sc];"
+        f"[1:a]aresample=44100,aformat=channel_layouts=mono,volume={MUSIC_GAIN},"
+        f"afade=t=in:st=0:d=2,afade=t=out:st={fade_start:.2f}:d=3[mu];"
+        "[mu][sc]sidechaincompress=threshold=0.03:ratio=6:attack=20:release=400[duck];"
+        "[vo][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+        "alimiter=limit=0.95:level=0,aformat=sample_rates=44100:channel_layouts=mono[aout]"
+    )
+    cmd = [ffmpeg_exe(), "-y", "-i", joined, "-stream_loop", "-1", "-i", music_path,
+           "-filter_complex_threads", "1", "-filter_complex", fc,
+           "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
+           "-shortest", "-movflags", "+faststart", out_path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("music mix fail: " + r.stderr[-300:])
+
+def keep_awake_loop(stop_event):
+    # Free Render server 15 minute bina visit ke so jata hai. Yeh har 4 minute mein apna hi page khol ke jagaye rakhta hai.
+    url = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    while not stop_event.wait(240):
+        try:
+            requests.get(url, timeout=15)
+        except Exception:
+            pass
+
+def run_long_video_job(job_id, script_text, title):
+    job = video_jobs[job_id]
+    work_dir = os.path.join(VIDEO_DIR, job_id + "_work")
+    warnings = []
+    stop_event = threading.Event()
+    threading.Thread(target=keep_awake_loop, args=(stop_event,), daemon=True).start()
+    try:
+        roman_text = extract_voiceover_text(script_text)
+        if not roman_text:
+            raise ValueError("Script se text nahi mila")
+        os.makedirs(work_dir, exist_ok=True)
+
+        job["msg"] = "Step 1/4: Script Hindi mein badli ja rahi hai..."
+        family = ensure_font()
+        if not family:
+            warnings.append("Hindi font download nahi hua, isliye captions nahi lage.")
+        hindi_pieces, conv_fail = [], 0
+        for piece in split_chunks(roman_text, LONG_CONVERT_CHARS):
+            h, ok = to_devanagari(piece)
+            hindi_pieces.append(h)
+            if not ok:
+                conv_fail += 1
+        if conv_fail:
+            warnings.append(f"{conv_fail} hisse ka Hindi conversion fail hua, wahan voice Roman text se bani (quality kam ho sakti hai).")
+        parts = split_chunks(" ".join(hindi_pieces), LONG_PART_CHARS)
+        n = len(parts)
+        if n == 0:
+            raise ValueError("Script se voice ke hisse nahi bane")
+
+        job["msg"] = "Step 2/4: Background aur book card ban rahe hain..."
+        base_png = os.path.join(work_dir, "base.png")
+        build_long_base(base_png, title, work_dir, warnings)
+
+        part_files, total_dur, backup_parts = [], 0.0, 0
+        started = time.time()
+        for i, part in enumerate(parts, 1):
+            eta = ""
+            if i > 1:
+                per = (time.time() - started) / (i - 1)
+                eta = f" (baaki lagbhag {int(per * (n - i + 1) / 60) + 1} minute)"
+            job["msg"] = f"Step 3/4: Part {i}/{n} ban raha hai (voice + video){eta}"
+            audio, ext = long_voice_part(part)
+            if ext != "wav":
+                backup_parts += 1
+            apath = os.path.join(work_dir, f"a{i}.{ext}")
+            with open(apath, "wb") as f:
+                f.write(audio)
+            dur = audio_duration(apath)
+            ass_path = None
+            if family:
+                ass_path = os.path.join(work_dir, f"c{i}.ass")
+                build_long_ass(part, dur, family, ass_path)
+            ppath = os.path.join(work_dir, f"p{i}.mp4")
+            render_long_part(base_png, apath, ass_path, FONT_DIR, ppath, dur)
+            part_files.append(ppath)
+            total_dur += dur
+            for tmp in (apath, ass_path):
+                if tmp and os.path.exists(tmp):
+                    os.remove(tmp)
+            job["voice"] = ("Voice: Gemini (Charon) ✅" if backup_parts == 0
+                            else f"Voice: {backup_parts}/{i} part BACKUP voice ⚠️ (Gemini voice nahi chali)")
+        if backup_parts:
+            warnings.append(f"{backup_parts} part mein Gemini voice fail hui, wahan backup voice lagi.")
+
+        job["msg"] = "Step 4/4: Saare parts jodke final video ban rahi hai..."
+        list_path = os.path.join(work_dir, "list.txt")
+        with open(list_path, "w") as f:
+            for p in part_files:
+                f.write(f"file '{p}'\n")
+        joined = os.path.join(work_dir, "joined.mp4")
+        r = subprocess.run([ffmpeg_exe(), "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                            "-c", "copy", "-movflags", "+faststart", joined], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("parts join fail: " + r.stderr[-300:])
+
+        out_path = os.path.join(VIDEO_DIR, job_id + ".mp4")
+        music_label = "music band (MUSIC_ON = False)"
+        done_music = False
+        if MUSIC_ON:
+            music_path, music_label = ensure_music(warnings)
+            if music_path:
+                try:
+                    job["msg"] = "Step 4/4: Background music mix ho rahi hai..."
+                    add_music_to_video(joined, music_path, out_path, total_dur)
+                    done_music = True
+                except Exception as e:
+                    print("Long music fail:", e)
+                    warnings.append("Music mix nahi hui, video bina music ke bani.")
+                    music_label = "music nahi laga"
+        if not done_music:
+            shutil.move(joined, out_path)
+        job["music"] = "Music: " + music_label
+        job["file"] = out_path
+        job["status"] = "done"
+        job["msg"] = "Video ready!"
+        job["note"] = " ".join(warnings)
+    except Exception as e:
+        print("Long video job fail:", e)
+        job["status"] = "error"
+        job["msg"] = str(e)[:500]
+    finally:
+        stop_event.set()
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------
 # SCRIPT + SEO
 # ---------------------------------------------------------------
 
@@ -1130,7 +1413,13 @@ def youtube_script():
             <button type="submit" style="background:#e67e22;">🎬 Video Banao (Stock + Zoom + Hindi Captions)</button>
         </form>"""
         else:
-            video_part = "<p style='color:#a94442;margin-top:15px;'>Long video ka render free server pe bahut slow hai, isliye abhi video sirf Short format ke liye hai.</p>"
+            video_part = f"""
+        <form method="POST" action="/dashboard/youtube/longvideo" style="margin-top:15px;">
+            <textarea name="script_text" style="display:none;">{escaped_script}</textarea>
+            <input type="hidden" name="book_name" value="{escaped_book}">
+            <button type="submit" style="background:#c0392b;">🎬 Long Video Banao (Book Card + Waveform + Hindi Captions)</button>
+        </form>
+        <p style="color:#666;font-size:13px;">Long video banne mein bahut time lagta hai. Pehle 5-10 minute ki test script se try karo.</p>"""
         action_block = video_part + f"""
         <form method="POST" action="/dashboard/youtube/audio" style="margin-top:5px;">
             <textarea name="script_text" style="display:none;">{escaped_script}</textarea>
@@ -1162,7 +1451,7 @@ def youtube_script():
             <label>Video format</label>
             <select name="format">
                 <option value="short" {"selected" if video_format=="short" else ""}>Short (45-60 sec, vertical)</option>
-                <option value="long" {"selected" if video_format=="long" else ""}>Long (7-10 min, horizontal)</option>
+                <option value="long" {"selected" if video_format=="long" else ""}>Long (35-40 min, horizontal)</option>
             </select>
 
             <button type="submit">Script Generate Karo</button>
@@ -1223,6 +1512,34 @@ def youtube_video_start():
     t.start()
     return redirect("/dashboard/youtube/video/" + job_id)
 
+# Long video job shuru karo (background mein chalega)
+@app.route("/dashboard/youtube/longvideo", methods=["POST"])
+def youtube_long_video_start():
+    script_text = request.form.get("script_text", "")
+    book_name = (request.form.get("book_name", "") or "Book Summary").strip()[:60]
+
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+    cleanup_old_videos()
+
+    job_id = uuid.uuid4().hex[:10]
+    video_jobs[job_id] = {
+        "status": "working",
+        "msg": "Shuru ho raha hai...",
+        "file": None,
+        "note": "",
+        "voice": "",
+        "music": "",
+        "script_text": script_text,
+        "start": time.time()
+    }
+    t = threading.Thread(
+        target=run_long_video_job,
+        args=(job_id, script_text, book_name),
+        daemon=True
+    )
+    t.start()
+    return redirect("/dashboard/youtube/video/" + job_id)
+
 # Video status page (apne aap refresh hota hai)
 @app.route("/dashboard/youtube/video/<job_id>")
 def youtube_video_status(job_id):
@@ -1241,7 +1558,7 @@ def youtube_video_status(job_id):
         <h3>⏳ Video ban raha hai...</h3>
         <p>{html_lib.escape(job['msg'])}</p>
         <p>Time ho gaya: {elapsed} second</p>
-        <p>Yeh page apne aap refresh hota rahega. Ise band mat karna, free server pe isme 3-8 minute lag sakte hain.</p>
+        <p>Yeh page apne aap refresh hota rahega. Ise band mat karna aur phone ki screen on rakhna. Short mein 3-8 minute lagte hain, Long mein bahut zyada (har 1 minute ki video par kai minute).</p>
         """
     elif job["status"] == "done":
         voice_line = html_lib.escape(job.get("voice", ""))
@@ -1303,3 +1620,4 @@ init_db()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
