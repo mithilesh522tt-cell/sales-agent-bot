@@ -917,7 +917,7 @@ LW, LH = 854, 480          # Long video ka size (480p). Server tez ho toh 1280, 
 LFPS = 10                  # frames per second (kam rakha hai taaki render tez ho)
 LONG_PART_CHARS = 700      # ek voice part mein kam se kam itne Hindi characters
 LONG_MAX_PART_CHARS = 4000 # ek voice request mein zyada se zyada itne characters (~4-5 minute ki awaaz)
-LONG_VOICE_ENGINE = "edge"  # "edge" = Microsoft Edge free voice (limit nahi). "gemini" = Gemini Charon (roz sirf 10 requests free)
+LONG_VOICE_ENGINE = "gemini"  # "gemini" = Gemini Charon (roz sirf 10 requests free, awaaz natural). "edge" = Microsoft Edge free voice (limit nahi, par robotic)
 EDGE_VOICE = "hi-IN-MadhurNeural"   # ya "hi-IN-SwaraNeural" (female)
 EDGE_RATE = "-4%"          # thoda dheema = zyada natural (pehle backup +10% tha, isliye robotic lagta tha)
 EDGE_PITCH = "-2Hz"
@@ -1262,6 +1262,545 @@ def run_long_video_job(job_id, script_text, title):
 
 
 # ---------------------------------------------------------------
+# LONG PROJECTS: voice ke hisse (parts) database mein save hote hain.
+# Gemini ki roz ki limit khatam ho jaye toh kal wahin se aage banao.
+# Saare parts ban jayein tab ek final lambi video apne aap jud jati hai.
+# ---------------------------------------------------------------
+project_jobs = {}
+
+def ensure_long_tables():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS long_projects (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            script_text TEXT,
+            hindi_parts TEXT,
+            created TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS long_audio (
+            project_id TEXT,
+            idx INTEGER,
+            ext TEXT,
+            data BYTEA,
+            dur REAL,
+            PRIMARY KEY (project_id, idx)
+        )
+    """)
+    cur.execute("ALTER TABLE long_projects ADD COLUMN IF NOT EXISTS outline TEXT")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS long_blobs (
+            project_id TEXT,
+            idx INTEGER,
+            data BYTEA,
+            PRIMARY KEY (project_id, idx)
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def proj_create(title, script_text):
+    ensure_long_tables()
+    pid = uuid.uuid4().hex[:10]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO long_projects (id, title, script_text) VALUES (%s, %s, %s)", (pid, title, script_text))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return pid
+
+def proj_get(pid):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT title, script_text, hindi_parts, outline FROM long_projects WHERE id = %s", (pid,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return None
+    return {"title": row[0] or "", "script": row[1] or "",
+            "parts": json.loads(row[2]) if row[2] else None,
+            "outline": json.loads(row[3]) if row[3] else None}
+
+def proj_set_parts(pid, parts):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE long_projects SET hindi_parts = %s WHERE id = %s", (json.dumps(parts, ensure_ascii=False), pid))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def proj_set_outline(pid, outline, script_text=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if script_text is None:
+        cur.execute("UPDATE long_projects SET outline = %s WHERE id = %s", (json.dumps(outline, ensure_ascii=False), pid))
+    else:
+        cur.execute("UPDATE long_projects SET outline = %s, script_text = %s WHERE id = %s",
+                    (json.dumps(outline, ensure_ascii=False), script_text, pid))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def proj_audio_info(pid):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT idx, dur FROM long_audio WHERE project_id = %s", (pid,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {int(r[0]): float(r[1] or 0) for r in rows}
+
+def proj_audio_save(pid, idx, ext, data, dur):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO long_audio (project_id, idx, ext, data, dur) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (project_id, idx) DO UPDATE SET ext = EXCLUDED.ext, data = EXCLUDED.data, dur = EXCLUDED.dur
+    """, (pid, idx, ext, psycopg2.Binary(data), dur))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def proj_audio_load(pid, idx):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT ext, data FROM long_audio WHERE project_id = %s AND idx = %s", (pid, idx))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        raise RuntimeError(f"Voice part {idx} database mein nahi mili")
+    return row[0], bytes(row[1])
+
+def proj_blob_save(pid, idx, data):
+    # idx 0 = background card image, idx 1.. = har part ki video (mp4)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO long_blobs (project_id, idx, data) VALUES (%s, %s, %s)
+        ON CONFLICT (project_id, idx) DO UPDATE SET data = EXCLUDED.data
+    """, (pid, idx, psycopg2.Binary(data)))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def proj_blob_info(pid):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT idx FROM long_blobs WHERE project_id = %s", (pid,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {int(r[0]) for r in rows}
+
+def proj_blob_load(pid, idx):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT data FROM long_blobs WHERE project_id = %s AND idx = %s", (pid, idx))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return bytes(row[0]) if row else None
+
+def proj_list():
+    ensure_long_tables()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT p.id, p.title, p.created, p.hindi_parts,
+               (SELECT COUNT(*) FROM long_audio a WHERE a.project_id = p.id)
+        FROM long_projects p ORDER BY p.created DESC LIMIT 15
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    out = []
+    for r in rows:
+        total = len(json.loads(r[3])) if r[3] else 0
+        out.append({"id": r[0], "title": r[1] or "", "created": r[2], "total": total, "done": int(r[4])})
+    return out
+
+def compress_for_store(audio, ext, work_dir):
+    # Voice ko chhota karke DB mein rakhte hain (5 minute ~ 3.6 MB). Returns (bytes, ext, duration)
+    src = os.path.join(work_dir, "in." + ext)
+    out = os.path.join(work_dir, "out.m4a")
+    with open(src, "wb") as f:
+        f.write(audio)
+    r = subprocess.run([ffmpeg_exe(), "-y", "-i", src, "-ac", "1", "-ar", "44100", "-c:a", "aac", "-b:a", "96k", out],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and os.path.exists(out):
+        with open(out, "rb") as f:
+            data = f.read()
+        return data, "m4a", audio_duration(out)
+    return audio, ext, audio_duration(src)
+
+# ---------------- Part-wise Long: har 5 minute ka part alag likha jata hai, par sab ek dusre se jude rehte hain ----------------
+PART_MINUTES = 5
+WORDS_PER_MIN = 125
+
+def seo_rules_text(hashtag_rule):
+    return f"""SEO ke rules (YouTube search aur click ke liye):
+- TITLE: 60 characters ke andar. Shuru mein main keyword (book ka naam + 'Book Summary in Hindi' ya 'Hindi Mein'), saath mein ek number ya curiosity. Jhooth wala clickbait nahi, jo video mein hai wahi promise karo.
+- DESCRIPTION: pehli 2 lines (150 characters ke andar) mein book ka naam, 'Book Summary in Hindi' aur hook ho. Phir 3-4 lines mein video ka summary, ek line mein "{CHANNEL_NAME}" ke naam ke saath channel ki pehchaan. Phir ek line: Like, Share, Comment aur Subscribe karna mat bhoolna. End mein ek line Devanagari Hindi mein (jaise 'बुक समरी हिंदी में'). Author ka naam tabhi likho jab pakka pata ho.
+- HASHTAGS: {hashtag_rule}
+- TAGS: 12-15 search keywords, comma se alag, Hinglish aur English mix, 3-4 tags Devanagari Hindi mein, kul 400 characters ke andar.
+- PINNED COMMENT: 1-2 line ka ek specific sawaal jo book ke twist se juda ho. Aakhir mein 'Agla raaz kaunsi book ka chahiye?' jaisi line jodo.
+- THUMBNAIL TEXT: 3-5 words, badi akshar mein dikhne layak, curiosity wale. Koi emoji nahi."""
+
+def generate_outline(book, minutes, n):
+    prompt = f"""Tum ek top YouTube scriptwriter aur SEO expert ho jo books ko Hindi mein suspense ke saath explain karta hai.
+Book: {book}
+Ek {minutes} minute ki lambi video ka plan banao. Video {n} parts mein banegi, har part lagbhag {PART_MINUTES} minute ka.
+
+Plan ke rules:
+- Poori video ek hi kahani ki tarah chale. Har part pichhle part se juda ho aur agle part ki taraf le jaye.
+- Shuru mein ek bada OPEN LOOP khule, aur end mein ek chonkane wala TWIST uska jawab de. Twist book ke asli idea se nikle.
+- Har part ke end mein agle part ke liye cliffhanger ho.
+- Book ke asli ideas hi use karo. Jhoothe statistics, nakli quotes ya banaye hue kisse nahi.
+
+{seo_rules_text("3 se 5 hashtags, sabse zaroori pehle (YouTube pehle 3 title ke upar dikhata hai).")}
+
+Output ka format bilkul yahi rakho (headings ke naam mat badalna, har cheez ek hi line mein):
+
+TITLE: (title)
+OPEN LOOP: (ek vakya jo shuru mein curiosity banayega)
+TWIST: (ek-do vakya, end ka bada palat)
+""" + "".join(f"PART {k}: (is part ka naam | is part mein kya samjhana hai | end ka cliffhanger)\n" for k in range(1, n + 1)) + """DESCRIPTION: (description)
+HASHTAGS: (hashtags)
+TAGS: (comma se alag keywords)
+PINNED COMMENT: (comment)
+THUMBNAIL TEXT: (text)
+"""
+    text = gemini_text(prompt).replace("**", "")
+    def one(label):
+        m = re.search(r"(?im)^\s*" + label + r"\s*:\s*(.+)$", text)
+        return m.group(1).strip() if m else ""
+    briefs = {}
+    for m in re.finditer(r"(?im)^\s*PART\s*(\d+)\s*:\s*(.+)$", text):
+        briefs[int(m.group(1))] = m.group(2).strip()
+    briefs_list = [briefs.get(k) or "Book ka agla bada idea samjhao aur agle part ke liye curiosity chhodo." for k in range(1, n + 1)]
+    seo_text = re.sub(r"(?im)^\s*(OPEN LOOP|TWIST|PART\s*\d+)\s*:.*$", "", text)
+    seo_text = re.sub(r"\n{3,}", "\n\n", seo_text).strip()
+    return {"open_loop": one("OPEN LOOP"), "twist": one("TWIST"), "briefs": briefs_list, "seo_text": seo_text}
+
+def part_target_words(minutes, n, k):
+    mins = PART_MINUTES if k < n else max(2, minutes - PART_MINUTES * (n - 1))
+    return mins * WORDS_PER_MIN
+
+def write_part_script(proj, k, parts):
+    o = proj["outline"]
+    n, minutes, book = o["n"], o["minutes"], o["book"]
+    words = part_target_words(minutes, n, k)
+    plan = "\n".join(f"PART {j}: {b}" for j, b in enumerate(o["briefs"], 1))
+    cta = (
+        "Ending mein yeh chaaron cheezein bolna zaroori hai, natural bolchal mein, 2-3 chhote vakyon mein: "
+        "(1) video pasand aaye toh LIKE karo, (2) kisi ek dost ko SHARE karo jise yeh sunna chahiye, "
+        "(3) COMMENT mein ek specific sawaal ka jawab likho (sawaal book ke topic se juda ho), "
+        f"(4) '{CHANNEL_NAME}' channel ko subscribe karne ki baat bolo."
+    )
+    if n == 1:
+        position = (f"Shuru mein HOOK (kaan khade karne wali pehli line), phir OPEN LOOP, phir ek chhoti line mein channel ka naam \"{CHANNEL_NAME}\". "
+                    f"End se pehle bada TWIST (open loop ka poora jawab), phir ek line ka takeaway, phir call to action. {cta}")
+    elif k == 1:
+        position = (f"Shuru mein HOOK (kaan khade karne wali pehli line, channel ka naam nahi), phir OPEN LOOP, phir ek chhoti line mein channel ka naam \"{CHANNEL_NAME}\" "
+                    "(jaise koi dost raaz khol raha ho), phir is part ke points. End mein cliffhanger jo agle part ki taraf le jaye. Is part mein like/subscribe ki baat mat karo.")
+    elif k < n:
+        position = ("Seedha pichhle part ki baat se jodkar shuru karo (jaise 'ab tak aapne dekha... lekin asli baat ab shuru hoti hai'). "
+                    "Koi naya intro, hook ya channel ka naam mat lo. End mein cliffhanger jo agle part ki taraf le jaye. Like/subscribe ki baat mat karo.")
+    else:
+        position = (f"Seedha pichhle part ki baat se jodkar shuru karo, koi naya intro nahi. End se pehle bada TWIST (open loop ka poora jawab), "
+                    f"phir ek line ka takeaway, phir call to action. {cta} Aakhri line mein agle raaz ka ishaara do, jaise 'Agla raaz isse bhi bada hai.'")
+    prev_tail = ""
+    if k > 1 and parts[k - 2]:
+        prev_tail = parts[k - 2][-400:]
+    prompt = f"""Tum ek top YouTube scriptwriter ho. Hindi (Devanagari) mein likho.
+Book: {book}
+Yeh {minutes} minute ki video {n} parts mein ban rahi hai. Abhi sirf PART {k}/{n} likho: kam se kam {words} words, aur {int(words * 1.1)} tak (lagbhag {words // WORDS_PER_MIN} minute ki awaaz).
+
+Poori video ka plan (sab parts ek kahani ki tarah jude hain):
+OPEN LOOP: {o['open_loop']}
+TWIST: {o['twist']}
+{plan}
+
+Is part ka kaam: {o['briefs'][k - 1]}
+{position}
+""" + (f'\nPichhla part yahan khatam hua (sirf jodne ke liye, ise dobara mat likhna): "{prev_tail}"\n' if prev_tail else "") + """
+Script likhne ke rules:
+- Devanagari Hindi mein likho. English shabd bhi Devanagari mein likho (जैसे माइंडसेट, हैबिट).
+- Chhote, tez vakya (zyada se zyada 12 words). Har vakya ke end mein purn viram (।), sawaal ya exclamation lagao.
+- Seedhi doston jaisi bolchal ki bhasha, jaise koi dost raaz bata raha ho.
+- Koi emoji, bullet list, markdown, heading, part ka number ya brackets mein stage directions nahi. Sirf wahi text likho jo bola jayega.
+- Book ke concepts apne shabdon mein samjhao. Jhoothe statistics, nakli quotes ya banaye hue kisse nahi.
+- Har point ke end mein ek alag cliffhanger line, ek hi line repeat mat karo. Ek point mein aam zindagi ka relatable scene dikhao (kisi asli insaan ka naam nahi).
+- Rhythm: chhote tez vakya, beech mein 2-3 words ka jhatka, phir ek shaant vakya.
+"""
+    text = gemini_text(prompt)
+    text = re.sub(r"```[a-zA-Z]*", "", text).replace("**", "").replace("#", "").strip()
+    text = re.sub(r"(?im)^\s*(PART|भाग)\s*\d+.*$", "", text).strip()
+    if len(text) < 300:
+        raise RuntimeError("Part ki script bahut chhoti aayi, dobara try karo")
+    return text
+
+def run_project_outline(pid):
+    pj = project_jobs[pid]
+    try:
+        proj = proj_get(pid)
+        o = proj["outline"]
+        pj["msg"] = "Video ka plan ban raha hai..."
+        res = generate_outline(o["book"], o["minutes"], o["n"])
+        o.update({"open_loop": res["open_loop"], "twist": res["twist"], "briefs": res["briefs"]})
+        proj_set_outline(pid, o, res["seo_text"])
+        proj_set_parts(pid, [""] * o["n"])
+        pj["status"] = "idle"
+        pj["msg"] = "Plan ban gaya."
+    except Exception as e:
+        print("Project outline fail:", e)
+        pj["status"] = "error"
+        pj["msg"] = "Plan nahi ban paya: " + str(e)[:300]
+        return
+    start_project_voice(pid)
+
+def run_project_prepare(pid):
+    pj = project_jobs[pid]
+    try:
+        proj = proj_get(pid)
+        roman = extract_voiceover_text(proj["script"])
+        if not roman:
+            raise ValueError("Script se text nahi mila")
+        pj["msg"] = "Script Hindi mein badli ja rahi hai..."
+        pieces, conv_fail = [], 0
+        for piece in split_chunks(roman, LONG_CONVERT_CHARS):
+            h, ok = to_devanagari(piece)
+            pieces.append(h)
+            if not ok:
+                conv_fail += 1
+        full = " ".join(pieces)
+        if LONG_VOICE_ENGINE == "edge":
+            parts = split_chunks(full, 900)
+        else:
+            est = max(1, -(-len(full) // LONG_MAX_PART_CHARS))
+            part_chars = max(LONG_PART_CHARS, int(len(full) / est * 1.08) + 1)
+            parts = split_chunks(full, part_chars)
+        if not parts:
+            raise ValueError("Script se voice ke hisse nahi bane")
+        proj_set_parts(pid, parts)
+        if conv_fail:
+            pj["warn"] = f"{conv_fail} hisse ka Hindi conversion fail hua, wahan voice Roman text se banegi (quality kam ho sakti hai)."
+        pj["status"] = "idle"
+        pj["msg"] = "Taiyari ho gayi."
+    except Exception as e:
+        print("Project prepare fail:", e)
+        pj["status"] = "error"
+        pj["msg"] = str(e)[:400]
+        return
+    start_project_voice(pid)
+
+def start_project_voice(pid):
+    pj = project_jobs.setdefault(pid, {"status": "idle", "msg": "", "warn": ""})
+    if pj["status"] in ("prepare", "voice", "render"):
+        return
+    pj["status"] = "voice"
+    pj["msg"] = "Voice shuru ho rahi hai..."
+    threading.Thread(target=run_project_voice, args=(pid,), daemon=True).start()
+
+def ensure_project_base(pid, title, work_dir, warnings):
+    # Background + book card ek baar banta hai aur DB mein save hota hai, taaki saare parts ek jaise dikhein
+    base_png = os.path.join(work_dir, "base.png")
+    data = proj_blob_load(pid, 0)
+    if data:
+        with open(base_png, "wb") as f:
+            f.write(data)
+    else:
+        build_long_base(base_png, title, work_dir, warnings)
+        with open(base_png, "rb") as f:
+            proj_blob_save(pid, 0, f.read())
+    return base_png
+
+def render_project_part(pid, i, part_text, family, base_png, work_dir):
+    ext, data = proj_audio_load(pid, i)
+    apath = os.path.join(work_dir, f"a{i}.{ext}")
+    with open(apath, "wb") as f:
+        f.write(data)
+    dur = audio_duration(apath)
+    ass_path = None
+    if family:
+        ass_path = os.path.join(work_dir, f"c{i}.ass")
+        build_long_ass(part_text, dur, family, ass_path)
+    ppath = os.path.join(work_dir, f"p{i}.mp4")
+    render_long_part(base_png, apath, ass_path, FONT_DIR, ppath, dur)
+    with open(ppath, "rb") as f:
+        proj_blob_save(pid, i, f.read())
+    for tmp in (apath, ass_path, ppath):
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+    return dur
+
+def run_project_voice(pid):
+    pj = project_jobs[pid]
+    stop_event = threading.Event()
+    threading.Thread(target=keep_awake_loop, args=(stop_event,), daemon=True).start()
+    work_dir = os.path.join(VIDEO_DIR, pid + "_vw")
+    all_done = False
+    try:
+        os.makedirs(work_dir, exist_ok=True)
+        proj = proj_get(pid)
+        parts = proj["parts"] or []
+        n = len(parts)
+        have = proj_audio_info(pid)
+        vids = proj_blob_info(pid)
+        family = ensure_font()
+        warnings = []
+        if not family:
+            warnings.append("Hindi font download nahi hua, isliye captions nahi lage.")
+        base_png = ensure_project_base(pid, proj["title"], work_dir, warnings)
+        if warnings:
+            pj["warn"] = " ".join(warnings)
+        for i in range(1, n + 1):
+            if not parts[i - 1]:
+                pj["msg"] = f"Part {i}/{n}: script likhi ja rahi hai..."
+                try:
+                    parts[i - 1] = write_part_script(proj, i, parts)
+                except Exception as e:
+                    pj["status"] = "paused"
+                    pj["msg"] = f"Part {i}/{n} ki script nahi ban payi (Gemini text limit ho sakti hai): {str(e)[:200]}. Thodi der baad ya kal 'Baaki parts banao' dabao."
+                    return
+                proj_set_parts(pid, parts)
+            part = parts[i - 1]
+            if i not in have:
+                pj["msg"] = f"Part {i}/{n}: voice ban rahi hai..."
+                audio, ext, err = long_voice_part(part)
+                if audio is None:
+                    pj["status"] = "paused"
+                    if "roz ki free limit" in err:
+                        pj["msg"] = f"Gemini ki roz ki free limit khatam ho gayi. {len(have)}/{n} parts bane hain, baaki kal 'Baaki parts banao' dabake banao."
+                    else:
+                        pj["msg"] = "Voice nahi bani: " + err
+                    return
+                data, ext2, dur = compress_for_store(audio, ext, work_dir)
+                proj_audio_save(pid, i, ext2, data, dur)
+                have[i] = dur
+                if LONG_VOICE_ENGINE != "edge":
+                    time.sleep(LONG_TTS_GAP)
+            if i not in vids:
+                pj["msg"] = f"Part {i}/{n}: video ban raha hai..."
+                render_project_part(pid, i, part, family, base_png, work_dir)
+                vids.add(i)
+        all_done = True
+        pj["status"] = "idle"
+        pj["msg"] = "Saare parts ban gaye."
+    except Exception as e:
+        print("Project voice fail:", e)
+        pj["status"] = "error"
+        pj["msg"] = str(e)[:400]
+    finally:
+        stop_event.set()
+        shutil.rmtree(work_dir, ignore_errors=True)
+    if all_done:
+        start_project_render(pid)
+
+def start_project_render(pid):
+    pj = project_jobs.setdefault(pid, {"status": "idle", "msg": "", "warn": ""})
+    if pj["status"] in ("prepare", "voice", "render"):
+        return
+    proj = proj_get(pid)
+    if not proj:
+        return
+    pj["status"] = "render"
+    pj["msg"] = "Video render shuru ho rahi hai..."
+    video_jobs[pid] = {
+        "status": "working", "msg": "Shuru ho raha hai...", "file": None, "note": "",
+        "voice": "", "music": "", "script_text": proj["script"], "start": time.time()
+    }
+    threading.Thread(target=run_project_render, args=(pid,), daemon=True).start()
+
+def run_project_render(pid):
+    job = video_jobs[pid]
+    pj = project_jobs[pid]
+    work_dir = os.path.join(VIDEO_DIR, pid + "_work")
+    warnings = []
+    stop_event = threading.Event()
+    threading.Thread(target=keep_awake_loop, args=(stop_event,), daemon=True).start()
+    try:
+        proj = proj_get(pid)
+        parts = proj["parts"] or []
+        n = len(parts)
+        have = proj_audio_info(pid)
+        missing = [i for i in range(1, n + 1) if i not in have]
+        if missing:
+            raise ValueError(f"Voice ke parts poore nahi hain (baaki: {len(missing)}).")
+        os.makedirs(work_dir, exist_ok=True)
+        vids = proj_blob_info(pid)
+        family, base_png = None, None
+        if any(i not in vids for i in range(1, n + 1)):
+            family = ensure_font()
+            base_png = ensure_project_base(pid, proj["title"], work_dir, warnings)
+        job["voice"] = "Voice: " + ("Edge " + EDGE_VOICE if LONG_VOICE_ENGINE == "edge" else "Gemini (Charon)")
+
+        part_files, total_dur = [], 0.0
+        for i, part in enumerate(parts, 1):
+            job["msg"] = f"Step 1/2: Part {i}/{n} taiyar kiya ja raha hai..."
+            pj["msg"] = job["msg"]
+            if i not in vids:
+                render_project_part(pid, i, part, family, base_png, work_dir)
+            ppath = os.path.join(work_dir, f"p{i}.mp4")
+            with open(ppath, "wb") as f:
+                f.write(proj_blob_load(pid, i))
+            part_files.append(ppath)
+            total_dur += have[i]
+
+        job["msg"] = "Step 2/2: Saare parts jodke final video ban rahi hai..."
+        pj["msg"] = job["msg"]
+        list_path = os.path.join(work_dir, "list.txt")
+        with open(list_path, "w") as f:
+            for p in part_files:
+                f.write(f"file '{p}'\n")
+        joined = os.path.join(work_dir, "joined.mp4")
+        r = subprocess.run([ffmpeg_exe(), "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                            "-c", "copy", "-movflags", "+faststart", joined], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("parts join fail: " + r.stderr[-300:])
+
+        os.makedirs(VIDEO_DIR, exist_ok=True)
+        out_path = os.path.join(VIDEO_DIR, pid + ".mp4")
+        music_label = "music band (MUSIC_ON = False)"
+        done_music = False
+        if MUSIC_ON:
+            music_path, music_label = ensure_music(warnings)
+            if music_path:
+                try:
+                    job["msg"] = "Step 2/2: Background music mix ho rahi hai..."
+                    add_music_to_video(joined, music_path, out_path, total_dur)
+                    done_music = True
+                except Exception as e:
+                    print("Project music fail:", e)
+                    warnings.append("Music mix nahi hui, video bina music ke bani.")
+                    music_label = "music nahi laga"
+        if not done_music:
+            shutil.move(joined, out_path)
+        job["music"] = "Music: " + music_label
+        job["file"] = out_path
+        job["status"] = "done"
+        job["msg"] = "Video ready!"
+        job["note"] = " ".join(warnings)
+        pj["status"] = "idle"
+        pj["msg"] = "Video ready!"
+    except Exception as e:
+        print("Project render fail:", e)
+        job["status"] = "error"
+        job["msg"] = str(e)[:500]
+        pj["status"] = "error"
+        pj["msg"] = str(e)[:400]
+    finally:
+        stop_event.set()
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+# ---------------------------------------------------------------
 # SCRIPT + SEO
 # ---------------------------------------------------------------
 
@@ -1500,9 +2039,9 @@ def youtube_script():
         <form method="POST" action="/dashboard/youtube/longvideo" style="margin-top:15px;">
             <textarea name="script_text" style="display:none;">{escaped_script}</textarea>
             <input type="hidden" name="book_name" value="{escaped_book}">
-            <button type="submit" style="background:#c0392b;">🎬 Long Video Banao (Book Card + Waveform + Hindi Captions)</button>
+            <button type="submit" style="background:#c0392b;">🎬 Long Video Project Shuru Karo</button>
         </form>
-        <p style="color:#666;font-size:13px;">Long video banne mein bahut time lagta hai. Pehle 5-10 minute ki test script se try karo.</p>"""
+        <p style="color:#666;font-size:13px;">Voice ke parts alag-alag din mein bhi ban sakte hain (Gemini ki roz ki limit ke hisaab se). Saare parts banne par final video apne aap judegi.</p>"""
         action_block = video_part + f"""
         <form method="POST" action="/dashboard/youtube/audio" style="margin-top:5px;">
             <textarea name="script_text" style="display:none;">{escaped_script}</textarea>
@@ -1525,7 +2064,7 @@ def youtube_script():
         </style>
     </head>
     <body>
-        <a class="back" href="/dashboard">&larr; Back</a>
+        <a class="back" href="/dashboard">&larr; Back</a> &nbsp;|&nbsp; <a class="back" href="/dashboard/longprojects">📂 Mere Long Projects</a>
         <h2>📚 Book Script Generator</h2>
         <form method="POST">
             <label>Book ka naam</label>
@@ -1544,11 +2083,13 @@ def youtube_script():
             </div>
             <script>
                 document.querySelector('select[name=format]').addEventListener('change', function() {{
-                    document.getElementById('minwrap').style.display = (this.value === 'long') ? 'block' : 'none';
+                    document.getElementById('minwrap').style.display = (this.value === 'long') ? 'block' : 'none'; document.getElementById('partbtn').style.display = (this.value === 'long') ? 'block' : 'none';
                 }});
             </script>
 
             <button type="submit">Script Generate Karo</button>
+            <button type="submit" id="partbtn" formaction="/dashboard/youtube/longparts"
+                    style="background:#8e44ad;display:{'block' if video_format=='long' else 'none'};">🧩 Part-wise Long Project (5-5 minute ke jude hue parts)</button>
         </form>
         {error_html}
         {"<div class='result'>" + escaped_result + "</div>" if script_result else ""}
@@ -1645,32 +2186,38 @@ def voice_test_audio():
     return Response(data, mimetype="audio/mpeg")
 
 # Long video job shuru karo (background mein chalega)
+@app.route("/dashboard/youtube/longparts", methods=["POST"])
+def youtube_long_parts_start():
+    book_name = (request.form.get("book_name", "") or "").strip()[:60]
+    if not book_name:
+        return redirect("/dashboard/youtube")
+    try:
+        raw_min = request.form.get("minutes", "").strip()
+        minutes = int(float(raw_min)) if raw_min else 35
+    except Exception:
+        minutes = 35
+    minutes = max(2, min(45, minutes))
+    n = max(1, -(-minutes // PART_MINUTES))
+    try:
+        pid = proj_create(book_name, "")
+        proj_set_outline(pid, {"partwise": True, "book": book_name, "minutes": minutes, "n": n})
+    except Exception as e:
+        return "Project nahi ban paya (database error): " + html_lib.escape(str(e)[:300]), 500
+    project_jobs[pid] = {"status": "prepare", "msg": "Video ka plan ban raha hai...", "warn": ""}
+    threading.Thread(target=run_project_outline, args=(pid,), daemon=True).start()
+    return redirect("/dashboard/longproject/" + pid)
+
 @app.route("/dashboard/youtube/longvideo", methods=["POST"])
 def youtube_long_video_start():
     script_text = request.form.get("script_text", "")
     book_name = (request.form.get("book_name", "") or "Book Summary").strip()[:60]
-
-    os.makedirs(VIDEO_DIR, exist_ok=True)
-    cleanup_old_videos()
-
-    job_id = uuid.uuid4().hex[:10]
-    video_jobs[job_id] = {
-        "status": "working",
-        "msg": "Shuru ho raha hai...",
-        "file": None,
-        "note": "",
-        "voice": "",
-        "music": "",
-        "script_text": script_text,
-        "start": time.time()
-    }
-    t = threading.Thread(
-        target=run_long_video_job,
-        args=(job_id, script_text, book_name),
-        daemon=True
-    )
-    t.start()
-    return redirect("/dashboard/youtube/video/" + job_id)
+    try:
+        pid = proj_create(book_name, script_text)
+    except Exception as e:
+        return "Project nahi ban paya (database error): " + html_lib.escape(str(e)[:300]), 500
+    project_jobs[pid] = {"status": "prepare", "msg": "Taiyari shuru ho rahi hai...", "warn": ""}
+    threading.Thread(target=run_project_prepare, args=(pid,), daemon=True).start()
+    return redirect("/dashboard/longproject/" + pid)
 
 # Video status page (apne aap refresh hota hai)
 @app.route("/dashboard/youtube/video/<job_id>")
@@ -1701,54 +2248,4 @@ def youtube_video_status(job_id):
         <video controls playsinline style="width:100%;max-width:420px;border-radius:8px;">
             <source src="/dashboard/youtube/video/{job_id}/file" type="video/mp4">
         </video>
-        <a class="dl" href="/dashboard/youtube/video/{job_id}/file?dl=1">⬇️ Video Download Karo</a>
-        <p>Banane mein {elapsed} second lage.</p>
-        <p>🎙️ {voice_line}<br>🎵 {music_line}</p>
-        {note_html}
-        {seo_html}
-        """
-    else:
-        body = f"""
-        <h3>❌ Video nahi ban paya</h3>
-        <p style="background:white;padding:10px;border-radius:6px;word-break:break-word;">{html_lib.escape(job['msg'])}</p>
-        <p>Is error ka screenshot bhej do, hum fix kar denge.</p>
-        """
-
-    return f"""
-    <html>
-    <head>
-        {refresh}
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{ font-family: Arial; background: #f0f2f5; padding: 20px; }}
-            a.back {{ color: #007bff; text-decoration: none; font-size: 16px; }}
-            a.dl {{ display: block; margin-top: 15px; padding: 12px; background: #28a745; color: white; text-align: center; border-radius: 5px; text-decoration: none; font-size: 16px; }}
-            {SEO_CSS}
-        </style>
-    </head>
-    <body>
-        <a class="back" href="/dashboard/youtube">&larr; Script Generator</a>
-        {body}
-    </body>
-    </html>
-    """
-
-@app.route("/dashboard/youtube/video/<job_id>/file")
-def youtube_video_file(job_id):
-    job = video_jobs.get(job_id)
-    if not job or job["status"] != "done" or not job["file"] or not os.path.exists(job["file"]):
-        return "Video file nahi mili", 404
-    as_attachment = request.args.get("dl") == "1"
-    return send_file(
-        job["file"],
-        mimetype="video/mp4",
-        as_attachment=as_attachment,
-        download_name="book_video.mp4",
-        conditional=True
-    )
-
-init_db()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+      
